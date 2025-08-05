@@ -311,7 +311,7 @@ class Config(BaseModel):
 
         return cls(**config_data)
 
-    async def get_server_config(self) -> tuple[str, int]:
+    def get_server_config(self) -> tuple[str, int]:
         """获取服务器配置 (host, port)
 
         Returns:

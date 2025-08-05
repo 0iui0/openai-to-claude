@@ -24,7 +24,7 @@ async def lifespan(app: FastAPI):
     from src.config.settings import get_config_file_path, reload_config
     from src.config.watcher import ConfigWatcher
 
-    host, port = await config.get_server_config()
+    host, port = config.get_server_config()
 
     # 配置Loguru日志
     configure_logging(config.logging)

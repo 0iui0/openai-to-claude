@@ -23,34 +23,34 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from src.config.settings import Config
 
 
-async def main():
+def main():
     """主启动函数"""
-    parser = argparse.ArgumentParser(description="启动 Anthropic-OpenAI Proxy")
-    parser.add_argument(
-        "--config", type=str, help="JSON 配置文件路径 (默认为 config/settings.json)"
-    )
-    parser.add_argument(
-        "--config-path",
-        type=str,
-        default="config/settings.json",
-        help="配置文件路径，可通过 CONFIG_PATH 环境变量指定",
-    )
-
-    args = parser.parse_args()
-
-    # 确保从项目根目录启动
-    project_root = Path(__file__).parent
-    os.chdir(project_root)
-
-    # 确定配置文件路径
-    config_path = args.config or os.getenv("CONFIG_PATH", args.config_path)
-
     try:
-        # 从 JSON 文件加载配置
-        config = await Config.from_file(config_path)
+        parser = argparse.ArgumentParser(description="启动 Anthropic-OpenAI Proxy")
+        parser.add_argument(
+            "--config", type=str, help="JSON 配置文件路径 (默认为 config/settings.json)"
+        )
+        parser.add_argument(
+            "--config-path",
+            type=str,
+            default="config/settings.json",
+            help="配置文件路径，可通过 CONFIG_PATH 环境变量指定",
+        )
 
-        # 打印启动信息
-        host, port = await config.get_server_config()
+        args = parser.parse_args()
+
+        # 确保从项目根目录启动
+        project_root = Path(__file__).parent
+        os.chdir(project_root)
+
+        # 确定配置文件路径
+        config_path = args.config or os.getenv("CONFIG_PATH", args.config_path)
+
+        # 同步加载配置
+        config = Config.from_file_sync(config_path)
+
+        # 获取服务器配置
+        host, port = config.get_server_config()
 
         print(f"🚀 启动 OpenAI To Claude Server...")
         print(f"   配置文件: {config_path}")
@@ -68,15 +68,13 @@ async def main():
             host=host,
             port=port,
             # reload=True,
-            workers=4,  # 这一行在 --reload 模式下会被忽略
             timeout_keep_alive=60,
             log_level=config.logging.level.lower(),
         )
-
     except Exception as e:
         print(f"❌ 启动失败: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

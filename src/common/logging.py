@@ -3,19 +3,8 @@
 import sys
 import uuid
 from pathlib import Path
-import traceback
 
 from loguru import logger
-
-
-def format_exception_truncated(record):
-    """格式化异常信息，截取前100个字符"""
-    if record["exception"]:
-        exc_text = "".join(traceback.format_exception(*record["exception"]))
-        if len(exc_text) > 1000:
-            return exc_text[:1000] + "..."
-        return exc_text
-    return ""
 
 
 def configure_logging(log_config) -> None:
@@ -29,23 +18,18 @@ def configure_logging(log_config) -> None:
 
     # 使用相对路径而不是绝对路径
     log_path = Path("logs/app.log")
-    
+
     # 确保日志目录存在，并设置正确的权限
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # 设置目录权限为755，确保当前用户可写
     log_path.parent.chmod(0o755)
-    
+
     # 如果日志文件已存在，确保其可写
     if log_path.exists():
         log_path.chmod(0o644)
 
     # 控制台日志格式（包含请求ID）
     console_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{extra[request_id]}</cyan> | <cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
-
-    # 文件日志格式（包含请求ID和截取的异常信息）
-    def file_format_with_truncated_exception(record):
-        exc_info = format_exception_truncated(record)
-        return f"{record['time'].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]} | {record['level'].name:<8} | {record['extra'].get('request_id', '---')} | {record['name']}:{record['line']} | {record['message']} | {exc_info}"
 
     # 配置控制台日志
     logger.add(
@@ -59,13 +43,11 @@ def configure_logging(log_config) -> None:
     # 配置文件日志（包含截取的异常堆栈）
     logger.add(
         str(log_path),
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {extra[request_id]} | {name}:{line} | {message}",
         level=log_config.level,
         rotation="10 MB",
         retention="1 day",
         encoding="utf-8",
-        backtrace=True,  # 启用回溯信息
-        diagnose=True,  # 启用诊断信息
+        enqueue=True,  # 异步写入
         filter=lambda record: record["extra"].setdefault("request_id", "---"),
     )
 
