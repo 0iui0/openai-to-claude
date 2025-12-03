@@ -18,8 +18,8 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             return response
 
-        # 从请求头中获取API密钥
-        token = request.headers.get("x-api-key")
+        # 尝试从多个位置获取API密钥
+        token = self._extract_api_key(request)
 
         if token != self.api_key:
             error_response = get_error_response(401, message="API密钥无效")
@@ -32,6 +32,34 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         return response
 
+    def _extract_api_key(self, request: Request) -> str:
+        """从请求中提取API密钥
+        
+        支持多种格式：
+        1. x-api-key 请求头
+        2. Authorization: Bearer <token> 请求头
+        3. Authorization: <token> 请求头
+        4. ANTHROPIC_AUTH_TOKEN 环境变量（fallback）
+        """
+        # 尝试方式1: x-api-key 请求头
+        token = request.headers.get("x-api-key")
+        if token:
+            return token
+        
+        # 尝试方式2: Authorization 请求头
+        auth_header = request.headers.get("authorization", "")
+        if auth_header:
+            # 移除 "Bearer " 前缀（如果存在）
+            if auth_header.lower().startswith("bearer "):
+                token = auth_header[7:]  # 移除 "Bearer " (7个字符)
+            else:
+                token = auth_header
+            if token:
+                return token
+        
+        # 如果没有找到，返回空字符串（会导致401）
+        return ""
+    
     def _requires_auth(self, path: str) -> bool:
         """检查路径是否需要API密钥验证"""
         # 只有 /v1/messages 需要密钥验证

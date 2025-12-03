@@ -142,6 +142,11 @@ class AnthropicToOpenAIConverter:
         # 转换消息列表
         messages = AnthropicToOpenAIConverter._convert_messages(anthropic_request)
 
+        # 提取system提示
+        system_prompt = AnthropicToOpenAIConverter._extract_system_prompt(
+            anthropic_request.system
+        )
+
         # 转换工具定义
         tools = AnthropicToOpenAIConverter._convert_tools(anthropic_request.tools)
 
@@ -194,6 +199,7 @@ class AnthropicToOpenAIConverter:
         # 构建OpenAI请求
         openai_request = OpenAIRequest(
             model=target_model,
+            system=system_prompt,
             messages=messages,
             max_tokens=final_max_tokens,
             temperature=final_temperature,
@@ -232,16 +238,13 @@ class AnthropicToOpenAIConverter:
             anthropic_request: Anthropic请求
 
         Returns:
-            OpenAI格式的消息列表
+            OpenAI格式的消息列表（不包括system消息，因为system应该在request级别）
         """
         messages = []
 
-        # 处理system消息
-        if anthropic_request.system:
-            system_messages = AnthropicToOpenAIConverter._convert_system_message(
-                anthropic_request.system
-            )
-            messages.extend(system_messages)
+        # 注意: 不在这里添加system消息
+        # system消息应该通过request的system参数传递，而不是作为消息列表的一部分
+        # 这符合某些API（如Anthropic）的期望，即system参数在request级别
 
         # 转换用户和助手消息
         for anthropic_msg in anthropic_request.messages:
@@ -260,6 +263,37 @@ class AnthropicToOpenAIConverter:
         )
 
         return filtered_messages
+
+    @staticmethod
+    def _extract_system_prompt(
+        system: str | list[AnthropicSystemMessage] | None,
+    ) -> str | None:
+        """
+        从Anthropic system字段提取系统提示（不作为消息，而是request参数）
+
+        Args:
+            system: Anthropic的system字段
+
+        Returns:
+            系统提示字符串或None
+        """
+        if not system:
+            return None
+
+        if isinstance(system, str):
+            # 字符串格式的system提示
+            return system
+        elif isinstance(system, list):
+            # 列表格式的system提示 - 拼接所有文本
+            texts = []
+            for system_msg in system:
+                if isinstance(system_msg, dict):
+                    texts.append(system_msg.get("text", ""))
+                elif hasattr(system_msg, "text"):
+                    texts.append(system_msg.text)
+            return "\n".join(texts) if texts else None
+
+        return None
 
     @staticmethod
     def _convert_system_message(

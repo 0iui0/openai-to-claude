@@ -86,6 +86,7 @@ class OpenAIRequest(BaseModel):
     """OpenAI API请求模型"""
 
     model: str = Field(description="使用的模型ID，如gpt-4o或claude-3-5-sonnet")
+    system: str | None = Field(None, description="系统级别的提示语（某些API如Anthropic支持）")
     messages: list[OpenAIMessage] = Field(description="对话消息列表")
     max_tokens: int | None = Field(None, description="最大输出token数量")
     max_completion_tokens: int | None = Field(
