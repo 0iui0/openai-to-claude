@@ -5,6 +5,7 @@ OpenAI-to-Claude请求转换器
 """
 
 import json
+import re
 from typing import Any
 
 from fastapi import HTTPException
@@ -35,41 +36,81 @@ class AnthropicToOpenAIConverter:
         anthropic_request: AnthropicRequest, request_id: str = None
     ) -> str:
         """
+        根据请求选择目标模型
+
+        规则：
+        1. 如果客户端指定了具体的模型名（非通用 Claude 名称），则直接使用该模型
+        2. 如果是通用的 Claude 模型名（如 claude-3-5-sonnet、claude-haiku），则使用智能路由
+        3. 智能路由会根据请求内容（工具使用、thinking、token 数量等）选择合适的模型
+
         Args:
             anthropic_request: Anthropic特定请求对象
+            request_id: 请求ID用于日志追踪
 
         Returns:
             选定的目标模型ID
         """
         original_model = anthropic_request.model
+
+        # 使用全局缓存的配置对象
+        from src.config.settings import get_config
+        config = await get_config()
+
+        # 获取绑定了请求ID的logger
+        from src.common.logging import get_logger_with_request_id
+        bound_logger = get_logger_with_request_id(request_id)
+
         # 如果模型包含逗号，直接返回原模型（保留复杂性）
         if original_model and "," in original_model:
+            bound_logger.info(f"使用客户端指定的复合模型: {original_model}")
             return original_model
 
-        # 使用全局缓存的配置对象（同步获取，因为转换器不是异步的）
-        from src.config.settings import get_config
+        # 检查是否为通用的 Claude 模型名称（需要智能路由）
+        # 通用名称示例: claude-3-5-sonnet, claude-3-haiku, claude-sonnet-4, etc.
+        # 注意：我们只检查通用的 Claude API 模型名，不包括具体的版本号（如 claude-sonnet-4-5）
+        is_generic_claude_model = original_model and (
+            # 匹配类似 claude-3-5-sonnet, claude-3-opus, claude-3-haiku 的模式（带版本号 2/3/4）
+            (bool(re.search(r'claude-[234]-\d*-?(sonnet|haiku|opus)', original_model.lower())))
+            or
+            # 匹配不带具体版本的通用名称，如 claude-sonnet, claude-haiku, claude-opus
+            (bool(re.search(r'^claude-(sonnet|haiku|opus)$', original_model.lower())))
+        )
 
-        config = await get_config()
+        # 如果不是通用 Claude 模型名称，直接使用客户端指定的模型（不进行智能路由）
+        if not is_generic_claude_model and original_model:
+            bound_logger.info(f"使用客户端直接指定的模型: {original_model}")
+            return original_model
+
+        # 使用智能路由选择模型
         if not config.models.default:
+            bound_logger.warning(f"配置中未设置默认模型，使用原始模型: {original_model}")
             return original_model
 
         resolved_model = config.models.default
+        routing_reason = "默认模型"
 
-        if "haiku" in original_model:
-            resolved_model = config.models.small
-        elif "sonnet" in original_model:
-            resolved_model = config.models.default
+        # 基于模型名称的路由
+        if original_model:
+            if "haiku" in original_model.lower():
+                resolved_model = config.models.small
+                routing_reason = "Haiku -> 小型模型"
+            elif "sonnet" in original_model.lower():
+                resolved_model = config.models.default
+                routing_reason = "Sonnet -> 默认模型"
 
         # 如果有tools定义，使用tool模型
         # if anthropic_request.tools and len(anthropic_request.tools) > 0:
         #     resolved_model = config.models.tool
+        #     routing_reason = "工具使用 -> 工具模型"
 
         # 如果thinking为enabled，使用think模型
         if (
             anthropic_request.thinking is not None
-            and anthropic_request.thinking["type"] == "enabled"
+            and isinstance(anthropic_request.thinking, dict)
+            and anthropic_request.thinking.get("type") == "enabled"
         ):
             resolved_model = config.models.think
+            routing_reason = "思考模式 -> 推理模型"
 
         # 计算token数量
         token_counter = TokenCounter()
@@ -80,13 +121,14 @@ class AnthropicToOpenAIConverter:
         )
         if total_tokens > 1000 * 100:
             resolved_model = config.models.long_context
+            routing_reason = f"长上下文({total_tokens} tokens) -> 长上下文模型"
 
         # 缓存token数量用于后续响应处理
         if request_id:
             from src.common.token_cache import cache_tokens
-
             cache_tokens(request_id, total_tokens)
 
+        # 检查 web_search 工具
         if anthropic_request.tools:
             has_web_search = any(
                 tool.type and "web_search" in tool.type
@@ -94,12 +136,16 @@ class AnthropicToOpenAIConverter:
             )
             if has_web_search:
                 resolved_model = config.models.web_search
+                routing_reason = "网页搜索 -> 搜索模型"
                 if "gemini" not in resolved_model:
                     raise HTTPException(
                         status_code=400,
                         detail="Web search is only supported with Gemini models",
                     )
 
+        bound_logger.info(
+            f"智能路由: {original_model} -> {resolved_model} (原因: {routing_reason})"
+        )
         return resolved_model
 
     @staticmethod

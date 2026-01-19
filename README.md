@@ -75,6 +75,116 @@ docker-compose down
 
 The service will start at `http://localhost:8000`.
 
+## 🎯 Model Selection
+
+The proxy service provides two ways to select models:
+
+### 1. Direct Model Specification (Client-Controlled)
+
+Clients can directly specify any model name in their requests. The proxy will use the exact model you specify:
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:8000/v1",
+    api_key="your-proxy-api-key-here"
+)
+
+# Direct model specification - uses exactly what you specify
+response = client.messages.create(
+    model="gpt-4o",  # Will use gpt-4o directly
+    messages=[{"role": "user", "content": "Hello!"}],
+    max_tokens=1024
+)
+
+# Another example - specify a custom model
+response = client.messages.create(
+    model="deepseek-ai/DeepSeek-V3",  # Will use this exact model
+    messages=[{"role": "user", "content": "Hello!"}],
+    max_tokens=1024
+)
+```
+
+### 2. Intelligent Routing (Automatic Selection)
+
+If you use generic Claude model names (like `claude-3-5-sonnet`, `claude-haiku`), the proxy will automatically route to the most appropriate model based on your request characteristics:
+
+```python
+# Using generic Claude model names triggers intelligent routing
+response = client.messages.create(
+    model="claude-3-5-sonnet",  # Will be routed based on request content
+    messages=[{"role": "user", "content": "Hello!"}],
+    max_tokens=1024
+)
+```
+
+#### Routing Rules
+
+The intelligent routing considers the following factors (in priority order):
+
+1. **Web Search Tool**: If your request includes `web_search` tools → Uses `web_search` model (Gemini only)
+2. **Long Context**: If total tokens > 100,000 → Uses `long_context` model
+3. **Thinking Mode**: If `thinking` is enabled → Uses `think` model (for reasoning)
+4. **Model Name Pattern**:
+   - Contains "haiku" → Uses `small` model
+   - Contains "sonnet" → Uses `default` model
+   - Contains "opus" → Uses `default` model
+
+#### Example: Intelligent Routing
+
+```python
+# Example 1: Automatic routing based on thinking mode
+response = client.messages.create(
+    model="claude-3-5-sonnet",
+    messages=[{"role": "user", "content": "Solve this complex problem..."}],
+    thinking={"type": "enabled"},  # Will route to "think" model
+    max_tokens=1024
+)
+
+# Example 2: Automatic routing for long context
+long_messages = [{"role": "user", "content": "..." * 50000}]  # Very long content
+response = client.messages.create(
+    model="claude-3-5-sonnet",
+    messages=long_messages,  # Will route to "long_context" model
+    max_tokens=1024
+)
+
+# Example 3: Automatic routing for web search
+response = client.messages.create(
+    model="claude-3-5-sonnet",
+    messages=[{"role": "user", "content": "Search for..."}],
+    tools=[{"type": "web_search", "name": "web_search"}],  # Will route to "web_search" model
+    max_tokens=1024
+)
+```
+
+### Model Configuration
+
+Configure the models used by intelligent routing in `config/settings.json`:
+
+```json
+{
+  "models": {
+    "default": "gpt-4o",              // For sonnet-like requests
+    "small": "gpt-4o-mini",           // For haiku-like requests
+    "think": "deepseek-ai/DeepSeek-R1", // For thinking/reasoning tasks
+    "long_context": "gemini-2.5-pro",  // For long context (>100k tokens)
+    "web_search": "gemini-2.5-flash"   // For web search tools
+  }
+}
+```
+
+### Choosing Between Direct vs Intelligent Routing
+
+| Use Case | Recommended Approach | Example |
+|----------|---------------------|---------|
+| You know exactly which model you want | Direct specification | `model="gpt-4o"` |
+| You want the proxy to optimize model selection | Intelligent routing | `model="claude-3-5-sonnet"` |
+| You're migrating from Anthropic Claude | Intelligent routing | Keep using `claude-*` model names |
+| You need consistent model behavior | Direct specification | Specify exact model name |
+| You want cost/performance optimization | Intelligent routing | Let proxy choose best model |
+
 ## 🛠️ Usage
 
 ### Claude Code Usage

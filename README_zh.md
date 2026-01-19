@@ -73,6 +73,116 @@ docker-compose down
 
 服务将在 `http://localhost:8000` 启动。
 
+## 🎯 模型选择
+
+代理服务提供两种模型选择方式：
+
+### 1. 直接指定模型（客户端控制）
+
+客户端可以在请求中直接指定任何模型名称。代理会使用您指定的确切模型：
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(
+    base_url="http://localhost:8000/v1",
+    api_key="your-proxy-api-key-here"
+)
+
+# 直接指定模型 - 将精确使用您指定的模型
+response = client.messages.create(
+    model="gpt-4o",  # 将直接使用 gpt-4o
+    messages=[{"role": "user", "content": "你好！"}],
+    max_tokens=1024
+)
+
+# 另一个例子 - 指定自定义模型
+response = client.messages.create(
+    model="deepseek-ai/DeepSeek-V3",  # 将使用这个确切的模型
+    messages=[{"role": "user", "content": "你好！"}],
+    max_tokens=1024
+)
+```
+
+### 2. 智能路由（自动选择）
+
+如果您使用通用的 Claude 模型名称（如 `claude-3-5-sonnet`、`claude-haiku`），代理将根据您的请求特征自动路由到最合适的模型：
+
+```python
+# 使用通用的 Claude 模型名称触发智能路由
+response = client.messages.create(
+    model="claude-3-5-sonnet",  # 将根据请求内容进行路由
+    messages=[{"role": "user", "content": "你好！"}],
+    max_tokens=1024
+)
+```
+
+#### 路由规则
+
+智能路由考虑以下因素（按优先级排序）：
+
+1. **网页搜索工具**：如果请求包含 `web_search` 工具 → 使用 `web_search` 模型（仅 Gemini）
+2. **长上下文**：如果总 token 数 > 100,000 → 使用 `long_context` 模型
+3. **思考模式**：如果启用了 `thinking` → 使用 `think` 模型（用于推理）
+4. **模型名称模式**：
+   - 包含 "haiku" → 使用 `small` 模型
+   - 包含 "sonnet" → 使用 `default` 模型
+   - 包含 "opus" → 使用 `default` 模型
+
+#### 示例：智能路由
+
+```python
+# 示例 1：基于思考模式的自动路由
+response = client.messages.create(
+    model="claude-3-5-sonnet",
+    messages=[{"role": "user", "content": "解决这个复杂问题..."}],
+    thinking={"type": "enabled"},  # 将路由到 "think" 模型
+    max_tokens=1024
+)
+
+# 示例 2：长上下文自动路由
+long_messages = [{"role": "user", "content": "..." * 50000}]  # 非常长的内容
+response = client.messages.create(
+    model="claude-3-5-sonnet",
+    messages=long_messages,  # 将路由到 "long_context" 模型
+    max_tokens=1024
+)
+
+# 示例 3：网页搜索自动路由
+response = client.messages.create(
+    model="claude-3-5-sonnet",
+    messages=[{"role": "user", "content": "搜索..."}],
+    tools=[{"type": "web_search", "name": "web_search"}],  # 将路由到 "web_search" 模型
+    max_tokens=1024
+)
+```
+
+### 模型配置
+
+在 `config/settings.json` 中配置智能路由使用的模型：
+
+```json
+{
+  "models": {
+    "default": "gpt-4o",                // 用于 sonnet 类请求
+    "small": "gpt-4o-mini",             // 用于 haiku 类请求
+    "think": "deepseek-ai/DeepSeek-R1", // 用于思考/推理任务
+    "long_context": "gemini-2.5-pro",   // 用于长上下文（>100k tokens）
+    "web_search": "gemini-2.5-flash"    // 用于网页搜索工具
+  }
+}
+```
+
+### 选择直接指定 vs 智能路由
+
+| 使用场景 | 推荐方式 | 示例 |
+|---------|---------|------|
+| 您明确知道要使用哪个模型 | 直接指定 | `model="gpt-4o"` |
+| 您希望代理优化模型选择 | 智能路由 | `model="claude-3-5-sonnet"` |
+| 您正在从 Anthropic Claude 迁移 | 智能路由 | 继续使用 `claude-*` 模型名称 |
+| 您需要一致的模型行为 | 直接指定 | 指定确切的模型名称 |
+| 您希望成本/性能优化 | 智能路由 | 让代理选择最佳模型 |
+
 ## 🛠️ 使用方法
 
 ### Claude Code 使用方法
