@@ -12,9 +12,16 @@ router = APIRouter()
 async def get_openai_client() -> OpenAIServiceClient:
     """获取OpenAI客户端实例"""
     config = await Config.from_file()
+    # 获取有效的API keys列表（支持单key和多key配置）
+    effective_keys = config.openai.get_effective_keys()
+    if not effective_keys:
+        raise ValueError("配置中没有有效的OpenAI API密钥")
+
+    # 使用第一个有效的API key
+    first_key = effective_keys[0]
     return OpenAIServiceClient(
-        api_key=config.openai.api_key,
-        base_url=config.openai.base_url,
+        api_key=first_key["api_key"],
+        base_url=first_key["base_url"],
     )
 
 

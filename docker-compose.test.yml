@@ -1,0 +1,20 @@
+services:
+  test:
+    container_name: openai-to-claude-test
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./config:/app/config
+      - ./tests:/app/tests
+      - ./src:/app/src
+    working_dir: /app
+    command: >
+      sh -c "
+        echo 'Running API Key Rotation Tests...' &&
+        uv run pytest tests/integration/test_api_key_rotation.py -v --tb=short
+      "
+    environment:
+      - CONFIG_PATH=config/settings.json
+      - LOG_LEVEL=DEBUG
+    # 测试不需要端口映射

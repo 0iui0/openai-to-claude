@@ -7,4 +7,9 @@ services:
     volumes:
       - ./config:/app/config  # 挂载配置文件目录
       - ./logs:/app/logs      # 挂载日志目录
+    # 如需使用代理，请取消注释以下行并替换为您的代理地址
+    # environment:
+    #   - https_proxy=http://your-proxy-address:port
+    #   - http_proxy=http://your-proxy-address:port
+    #   - NO_PROXY=localhost,127.0.0.1
     restart: unless-stopped  # 容器在停止后会自动重启，除非手动停止

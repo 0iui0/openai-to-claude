@@ -1,27 +1,49 @@
 {
-  "openai": {
-    "api_key": "your-openai-api-key-here",
-    "base_url": "https://api.openai.com/v1"
-  },
-  "server": {
-    "host": "0.0.0.0",
-    "port": 8000
-  },
-  "api_key": "your-proxy-api-key-here",
-  "logging": {
-    "level": "INFO"
-  },
-  "models": {
-    "default": "Qwen/Qwen3-Coder",
-    "small": "deepseek-ai/DeepSeek-V3-0324",
-    "think": "deepseek-ai/DeepSeek-R1-0528",
-    "long_context": "gemini-2.5-pro",
-    "web_search": "gemini-2.5-flash"
-  },
-  "parameter_overrides": {
-    "max_tokens": null,
-    "temperature": null,
-    "top_p": null,
-    "top_k": null
-  }
+    "openai": {
+        "api_key": null,
+        "base_url": "https://api.openai.com/v1",
+        "api_keys": [
+            {
+                "api_key": "your-first-openai-api-key-here",
+                "daily_limit": 150.0,
+                "base_url": null
+            },
+            {
+                "api_key": "your-second-openai-api-key-here",
+                "daily_limit": 150.0,
+                "base_url": null
+            },
+            {
+                "api_key": "your-third-openai-api-key-here",
+                "daily_limit": 150.0,
+                "base_url": null
+            }
+        ],
+        "_comment_single_key": "如果只有一个 API key，使用下面的格式替代 api_keys",
+        "_comment_single_key_format": {
+            "api_key": "your-openai-api-key-here",
+            "base_url": "https://api.openai.com/v1"
+        }
+    },
+    "server": {
+        "host": "0.0.0.0",
+        "port": 8000
+    },
+    "api_key": "your-proxy-api-key-here",
+    "logging": {
+        "level": "INFO"
+    },
+    "models": {
+        "default": "Qwen/Qwen3-Coder",
+        "small": "deepseek-ai/DeepSeek-V3-0324",
+        "think": "deepseek-ai/DeepSeek-R1-0528",
+        "long_context": "gemini-2.5-pro",
+        "web_search": "gemini-2.5-flash"
+    },
+    "parameter_overrides": {
+        "max_tokens": null,
+        "temperature": null,
+        "top_p": null,
+        "top_k": null
+    }
 }

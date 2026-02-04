@@ -14,8 +14,15 @@ from src.models.openai import OpenAIRequest, OpenAIStreamResponse
 class OpenAIClientError(Exception):
     """Base exception for OpenAI client errors."""
 
-    def __init__(self, error_response: StandardErrorResponse):
+    def __init__(
+        self,
+        error_response: StandardErrorResponse,
+        status_code: int | None = None,
+        error_message: str | None = None,
+    ):
         self.error_response = error_response
+        self.status_code = status_code
+        self.error_message = error_message
         super().__init__(str(error_response))
 
 
@@ -35,8 +42,8 @@ class OpenAIServiceClient:
             base_url: OpenAI API基础URL
             timeout: 请求超时时间(秒)
         """
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
         self.timeout = timeout
 
         self.client = httpx.AsyncClient(
@@ -48,6 +55,34 @@ class OpenAIServiceClient:
             # 确保自动解压缩响应
             follow_redirects=True,
             timeout=timeout,
+        )
+
+    @property
+    def api_key(self) -> str:
+        """获取当前API key"""
+        return self._api_key
+
+    @property
+    def base_url(self) -> str:
+        """获取当前base URL"""
+        return self._base_url
+
+    def update_credentials(self, api_key: str, base_url: str | None = None):
+        """动态更新API密钥和Base URL
+
+        Args:
+            api_key: 新的API密钥
+            base_url: 新的Base URL（可选）
+        """
+        self._api_key = api_key
+        if base_url:
+            self._base_url = base_url.rstrip("/")
+
+        # 更新HTTP客户端的Authorization header
+        self.client.headers["Authorization"] = f"Bearer {api_key}"
+
+        logger.info(
+            f"API凭证已更新 - API Key: {api_key[:8]}...{api_key[-4:]}, Base URL: {self._base_url}"
         )
 
     async def __aenter__(self):
@@ -86,7 +121,7 @@ class OpenAIServiceClient:
 
         bound_logger = get_logger_with_request_id(request_id)
 
-        url = f"{self.base_url}{endpoint}"
+        url = f"{self._base_url}{endpoint}"
         request_data = request.model_dump(exclude_none=True)
 
         # 记录请求详情
@@ -151,7 +186,9 @@ class OpenAIServiceClient:
                     status_code=e.response.status_code,
                     message=response_body,
                     details={"type": "http_error"},
-                )
+                ),
+                e.response.status_code,
+                response_body,
             )
 
         except httpx.TimeoutException as e:
@@ -163,7 +200,9 @@ class OpenAIServiceClient:
                     status_code=504,
                     message=str(e),
                     details={"type": "timeout_error", "original_error": str(e)},
-                )
+                ),
+                504,
+                str(e),
             )
 
         except httpx.ConnectError as e:
@@ -175,7 +214,9 @@ class OpenAIServiceClient:
                     status_code=502,
                     message=str(e),
                     details={"type": "connection_error", "original_error": str(e)},
-                )
+                ),
+                502,
+                str(e),
             )
 
     async def send_streaming_request(
@@ -202,7 +243,7 @@ class OpenAIServiceClient:
 
         bound_logger = get_logger_with_request_id(request_id)
 
-        url = f"{self.base_url}{endpoint}"
+        url = f"{self._base_url}{endpoint}"
 
         # Ensure streaming is enabled
         request_dict = request.model_dump(exclude_none=True)
@@ -212,7 +253,7 @@ class OpenAIServiceClient:
         bound_logger.info(
             f"发送OpenAI流式请求 - URL: {url}, Model: {request_dict.get('model', 'unknown')}, Messages: {len(request_dict.get('messages', []))}, Stream: True"
         )
-        
+
         try:
             async with self.client.stream(
                 "POST",
@@ -272,7 +313,9 @@ class OpenAIServiceClient:
                     status_code=e.response.status_code,
                     message=f"HTTP {e.response.status_code} error",
                     details={"type": "http_error"},
-                )
+                ),
+                e.response.status_code,
+                error_body,
             )
 
         except httpx.TimeoutException as e:
@@ -282,7 +325,9 @@ class OpenAIServiceClient:
                     status_code=504,
                     message="Request timeout",
                     details={"type": "timeout_error"},
-                )
+                ),
+                504,
+                str(e),
             )
 
         except httpx.ConnectError as e:
@@ -292,7 +337,9 @@ class OpenAIServiceClient:
                     status_code=502,
                     message="Connection error",
                     details={"type": "connection_error"},
-                )
+                ),
+                502,
+                str(e),
             )
 
     async def _parse_streaming_chunk(

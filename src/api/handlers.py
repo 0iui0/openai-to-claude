@@ -12,7 +12,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-from src.core.clients.openai_client import OpenAIServiceClient
+from src.core.api_key_rotator import APIKeyRotator
+from src.core.clients.openai_client import OpenAIClientError, OpenAIServiceClient
 from src.core.converters.request_converter import (
     AnthropicToOpenAIConverter,
 )
@@ -34,10 +35,28 @@ class MessagesHandler:
         self.response_converter = OpenAIToAnthropicConverter()
         self.config = config
         self._config = None
-        self.client = OpenAIServiceClient(
-            api_key=config.openai.api_key,
-            base_url=config.openai.base_url,
-        )
+
+        # 初始化 API Key 轮换器
+        api_keys_config = config.openai.get_effective_keys()
+        if not api_keys_config:
+            raise ValueError("未配置任何 API Key")
+
+        # 如果只有一个 key，不需要轮换器，直接使用
+        if len(api_keys_config) == 1:
+            self.key_rotator = None
+            self.client = OpenAIServiceClient(
+                api_key=api_keys_config[0]["api_key"],
+                base_url=api_keys_config[0]["base_url"],
+            )
+        else:
+            # 多个 keys，使用轮换器（默认使用会话粘性策略）
+            self.key_rotator = APIKeyRotator(api_keys_config, strategy="session_affinity")
+            # 使用轮换器选择的当前 key 初始化客户端（使用默认会话）
+            current_key = self.key_rotator.get_current_key(session_id="default")
+            self.client = OpenAIServiceClient(
+                api_key=current_key.api_key,
+                base_url=current_key.base_url,
+            )
 
     @classmethod
     async def create(cls, config=None):
@@ -52,11 +71,122 @@ class MessagesHandler:
         instance.response_converter = OpenAIToAnthropicConverter()
         instance.config = config
         instance._config = config
-        instance.client = OpenAIServiceClient(
-            api_key=config.openai.api_key,
-            base_url=config.openai.base_url,
-        )
+
+        # 初始化 API Key 轮换器
+        api_keys_config = config.openai.get_effective_keys()
+        if not api_keys_config:
+            raise ValueError("未配置任何 API Key")
+
+        # 如果只有一个 key，不需要轮换器，直接使用
+        if len(api_keys_config) == 1:
+            instance.key_rotator = None
+            instance.client = OpenAIServiceClient(
+                api_key=api_keys_config[0]["api_key"],
+                base_url=api_keys_config[0]["base_url"],
+            )
+        else:
+            # 多个 keys，使用轮换器（默认使用会话粘性策略）
+            instance.key_rotator = APIKeyRotator(api_keys_config, strategy="session_affinity")
+            # 使用轮换器选择的当前 key 初始化客户端（使用默认会话）
+            current_key = instance.key_rotator.get_current_key(session_id="default")
+            instance.client = OpenAIServiceClient(
+                api_key=current_key.api_key,
+                base_url=current_key.base_url,
+            )
+
         return instance
+
+    async def _handle_client_error_with_retry(
+        self,
+        error: OpenAIClientError,
+        request_id: str | None = None,
+    ):
+        """处理客户端错误并根据需要切换 API key
+
+        Args:
+            error: OpenAI 客户端错误
+            request_id: 请求 ID (用作 session_id)
+
+        Raises:
+            HTTPException: 如果无法恢复或所有 keys 都不可用
+        """
+        from src.common.logging import get_logger_with_request_id
+
+        bound_logger = get_logger_with_request_id(request_id)
+
+        if self.key_rotator is None:
+            # 没有轮换器，直接抛出错误
+            bound_logger.warning("未启用 API Key 轮换，直接返回错误")
+            raise HTTPException(
+                status_code=error.error_response.status,
+                detail=error.error_response.model_dump(exclude_none=True),
+            )
+
+        # 使用轮换器处理错误
+        status_code = error.status_code or 500
+        error_message = error.error_message or str(error.error_response.error)
+
+        self.key_rotator.handle_error(status_code, error_message)
+
+        # 检查是否切换了 key (使用 request_id 作为 session_id)
+        current_key = self.key_rotator.get_current_key(session_id=request_id or "default")
+        self.client.update_credentials(current_key.api_key, current_key.base_url)
+
+        # 尝试重新请求
+        bound_logger.info(f"已切换到新的 API Key: {current_key.index}")
+
+    async def _send_request_with_retry(
+        self,
+        openai_request,
+        request_id: str | None = None,
+        max_retries: int = 3,
+    ):
+        """发送请求并在配额用尽时自动重试
+
+        Args:
+            openai_request: OpenAI 请求对象
+            request_id: 请求 ID
+            max_retries: 最大重试次数
+
+        Returns:
+            OpenAI 响应
+
+        Raises:
+            HTTPException: 如果所有重试都失败
+        """
+        from src.common.logging import get_logger_with_request_id
+
+        bound_logger = get_logger_with_request_id(request_id)
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                return await self.client.send_request(
+                    openai_request, request_id=request_id
+                )
+
+            except OpenAIClientError as e:
+                last_error = e
+                bound_logger.warning(
+                    f"请求失败 (尝试 {attempt + 1}/{max_retries}) - Status: {e.status_code}"
+                )
+
+                # 如果有轮换器，尝试切换 key 并重试 (使用 request_id 作为 session_id)
+                if self.key_rotator and attempt < max_retries - 1:
+                    await self._handle_client_error_with_retry(e, request_id=request_id or "default")
+                    # 继续下一次尝试
+                    continue
+                else:
+                    # 没有轮换器或已达最大重试次数，抛出错误
+                    raise
+
+        # 所有重试都失败
+        raise HTTPException(
+            status_code=last_error.error_response.status if last_error else 500,
+            detail=last_error.error_response.model_dump(exclude_none=True)
+            if last_error
+            else {"error": {"message": "所有重试都失败"}},
+        )
 
     async def process_message(
         self, request: AnthropicRequest, request_id: str = None
@@ -76,8 +206,8 @@ class MessagesHandler:
                 request, request_id
             )
 
-            # 发送到 OpenAI
-            openai_response = await self.client.send_request(
+            # 发送到 OpenAI（带重试机制）
+            openai_response = await self._send_request_with_retry(
                 openai_request, request_id=request_id
             )
             bound_logger.debug(
@@ -100,6 +230,14 @@ class MessagesHandler:
             bound_logger.info(
                 f"Anthropic 响应生成完成 - Text: {response_text[:100]}..., Usage: {anthropic_response.usage}"
             )
+
+            # 标记 API key 使用成功，并统计 token 使用量
+            if self.key_rotator and anthropic_response.usage:
+                total_tokens = (
+                    (anthropic_response.usage.input_tokens or 0)
+                    + (anthropic_response.usage.output_tokens or 0)
+                )
+                self.key_rotator.mark_key_success(tokens_used=total_tokens)
 
             return anthropic_response
 
@@ -155,6 +293,7 @@ class MessagesHandler:
         from src.common.logging import get_logger_with_request_id
 
         bound_logger = get_logger_with_request_id(request_id)
+        total_tokens_used = 0  # 用于收集流式响应的 token 使用量
 
         try:
             # await validate_anthropic_request(request, request_id)
@@ -185,8 +324,28 @@ class MessagesHandler:
                 openai_stream_generator(), model=request.model, request_id=request_id
             ):
                 bound_logger.debug(f"Anthropic event: {anthropic_event}")
+
+                # 尝试从事件中提取 usage 信息
+                try:
+                    event_data = json.loads(anthropic_event.split("data: ")[1])
+                    if "usage" in event_data and event_data["usage"]:
+                        usage = event_data["usage"]
+                        total_tokens_used = (
+                            (usage.get("input_tokens") or 0)
+                            + (usage.get("output_tokens") or 0)
+                        )
+                        bound_logger.debug(
+                            f"流式响应 token 使用量: {total_tokens_used}"
+                        )
+                except (IndexError, json.JSONDecodeError, KeyError):
+                    pass
+
                 yield anthropic_event
             bound_logger.info("流式转换完成")
+
+            # 标记 API key 使用成功，并统计 token 使用量
+            if self.key_rotator and total_tokens_used > 0:
+                self.key_rotator.mark_key_success(tokens_used=total_tokens_used)
 
         except (ValidationError, ValueError) as e:
             error_detail = e.errors() if hasattr(e, "errors") else str(e)

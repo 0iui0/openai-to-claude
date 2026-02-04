@@ -19,12 +19,12 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# 设置 pip 使用清华大学镜像
-RUN pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
-    pip3 config set global.trusted-host pypi.tuna.tsinghua.edu.cn
+# 设置 pip 使用阿里云镜像
+RUN pip3 config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+    pip3 config set global.trusted-host mirrors.aliyun.com
 
-# 设置 uv 使用清华大学镜像
-ENV UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+# 设置 uv 使用阿里云镜像
+ENV UV_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # 复制项目文件
 COPY . .

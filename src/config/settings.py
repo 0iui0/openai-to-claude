@@ -1,10 +1,11 @@
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import aiofiles
 from loguru import logger
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # 全局配置缓存
 _config_instance = None
@@ -73,11 +74,67 @@ def get_config_file_path() -> str:
     return os.getenv("CONFIG_PATH", "config/settings.json")
 
 
+class OpenAIKeyConfig(BaseModel):
+    """单个OpenAI API Key配置"""
+
+    api_key: str = Field(..., description="OpenAI API密钥")
+    name: str = Field(..., description="API Key别名，用于统计和日志识别")
+    daily_limit: float | None = Field(None, description="每日限额（元）")
+    base_url: str | None = Field(None, description="API基础URL（可选，覆盖全局配置）")
+    weight: float = Field(1.0, description="权重，用于加权随机选择")
+
+
 class OpenAIConfig(BaseModel):
     """OpenAI API 配置"""
 
-    api_key: str = Field(..., description="OpenAI API密钥")
+    # 支持两种配置方式：
+    # 1. 单个 API key（兼容旧配置）
+    api_key: str | None = Field(default=None, description="OpenAI API密钥（单个，兼容旧配置）")
     base_url: str = Field("https://api.openai.com/v1", description="OpenAI API基础URL")
+
+    # 2. 多个 API keys（新配置）
+    api_keys: list[OpenAIKeyConfig] | None = Field(default=None, description="OpenAI API密钥列表（多个，支持轮换）")
+
+    @model_validator(mode='after')
+    def validate_api_keys(self):
+        """验证至少配置了一种 API key"""
+        if self.api_key is None and (self.api_keys is None or len(self.api_keys) == 0):
+            raise ValueError("必须配置 api_key 或 api_keys 中的至少一个")
+        return self
+
+    def get_effective_keys(self) -> list[dict[str, Any]]:
+        """获取有效的API keys列表
+
+        Returns:
+            API key配置列表，每个元素包含 api_key, name, daily_limit, base_url, weight
+        """
+        # 如果配置了多个keys，使用多key模式
+        if self.api_keys:
+            return [
+                {
+                    "api_key": key_config.api_key,
+                    "name": key_config.name,
+                    "daily_limit": key_config.daily_limit,
+                    "base_url": key_config.base_url or self.base_url,
+                    "weight": key_config.weight,
+                }
+                for key_config in self.api_keys
+            ]
+
+        # 否则使用单个key模式（兼容旧配置）
+        if self.api_key:
+            return [
+                {
+                    "api_key": self.api_key,
+                    "name": "default",
+                    "daily_limit": None,
+                    "base_url": self.base_url,
+                    "weight": 1.0,
+                }
+            ]
+
+        # 都没有配置，返回空列表
+        return []
 
 
 class ServerConfig(BaseModel):
@@ -119,22 +176,22 @@ class ModelConfig(BaseModel):
     """
 
     default: str = Field(
-        description="默认通用模型", default="claude-3-5-sonnet-20241022"
+        description="默认通用模型", default="claude-sonnet-4-5"
     )
     small: str = Field(
-        description="轻量级模型，用于简单任务", default="claude-3-5-haiku-20241022"
+        description="轻量级模型，用于简单任务", default="claude-sonnet-4-5"
     )
     tool: str = Field(
-        description="工具使用专用模型", default="claude-3-5-sonnet-20241022"
+        description="工具使用专用模型", default="claude-sonnet-4-5"
     )
     think: str = Field(
         description="深度思考模型，用于复杂推理任务",
-        default="claude-3-7-sonnet-20250219",
+        default="claude-sonnet-4-5",
     )
     long_context: str = Field(
-        description="长上下文处理模型", default="claude-3-7-sonnet-20250219"
+        description="长上下文处理模型", default="claude-sonnet-4-5"
     )
-    web_search: str = Field(description="网络搜索模型", default="gemini-2.5-flash")
+    web_search: str = Field(description="网络搜索模型", default="claude-sonnet-4-5")
 
 
 class ParameterOverridesConfig(BaseModel):
