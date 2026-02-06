@@ -411,12 +411,13 @@ class APIKeyRotator:
         Returns:
             是否为配额用尽错误
         """
-        # 检查状态码
+        # 首先检查状态码（优先级最高）
         if status_code in self.QUOTA_ERROR_CODES:
             return True
 
-        # 检查错误消息
-        if error_message:
+        # 对于4xx客户端错误，检查错误消息是否包含配额相关关键词
+        # 注意：5xx服务器错误不应该被当作配额用尽，因为那是服务器问题，不是客户端配额问题
+        if error_message and 400 <= status_code < 500:
             error_lower = error_message.lower()
             for pattern in self.QUOTA_ERROR_PATTERNS:
                 if pattern in error_lower:
@@ -440,6 +441,17 @@ class APIKeyRotator:
             # API key无效
             logger.error(f"检测到无效的API Key - Status: {status_code}")
             self.mark_key_quota_exhausted(f"Invalid API key: {error_message}")
+        elif status_code == 500:
+            # 特殊处理：500错误虽然通常是服务器问题，但如果错误消息明确表示配额用尽
+            # 则应该标记为配额用尽（某些API服务使用500状态码返回配额错误）
+            if error_message and any(keyword in error_message.lower() for keyword in ["额度已用完", "quota exceeded", "配额用尽", "insufficient quota"]):
+                logger.warning(
+                    f"500错误但消息表明配额用尽 - Status: {status_code}, Error: {error_message}"
+                )
+                self.mark_key_quota_exhausted(error_message)
+            else:
+                # 其他500错误仅记录失败，不标记为配额用尽
+                self.mark_key_failure(error_message)
         else:
             # 其他错误，仅记录不切换
             self.mark_key_failure(error_message)

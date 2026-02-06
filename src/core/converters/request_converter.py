@@ -60,6 +60,19 @@ class AnthropicToOpenAIConverter:
         from src.common.logging import get_logger_with_request_id
         bound_logger = get_logger_with_request_id(request_id)
 
+        # 规范化模型名称：移除日期后缀（如 claude-sonnet-4-5-20250929 -> claude-sonnet-4-5）
+        normalized_model = original_model
+        if original_model:
+            # 匹配模型名称末尾的日期后缀模式：-YYYYMMDD
+            date_suffix_pattern = r'-\d{8}$'
+            if re.search(date_suffix_pattern, original_model):
+                normalized_model = re.sub(date_suffix_pattern, '', original_model)
+                bound_logger.info(
+                    f"检测到带日期后缀的模型名称: {original_model} -> 规范化为: {normalized_model}"
+                )
+                # 使用规范化后的模型名称继续处理
+                original_model = normalized_model
+
         # 如果模型包含逗号，直接返回原模型（保留复杂性）
         if original_model and "," in original_model:
             bound_logger.info(f"使用客户端指定的复合模型: {original_model}")
@@ -481,9 +494,24 @@ class AnthropicToOpenAIConverter:
                         ):
                             content = content_parts[0]["text"]
                         else:
-                            content = content_parts
+                            # 多个内容部分，确保格式正确
+                            validated_parts = []
+                            for part in content_parts:
+                                if isinstance(part, dict):
+                                    # 确保至少有 type 字段
+                                    if "type" not in part:
+                                        part = {"type": "text", "text": str(part)}
+                                    validated_parts.append(part)
+                                else:
+                                    # 转换为字典
+                                    validated_parts.append({"type": "text", "text": str(part)})
+                            content = validated_parts if validated_parts else None
 
                     # 创建主消息
+                    # 如果有tool_calls但没有content，设置content为空字符串（上游API不接受content=null）
+                    if content is None and tool_calls:
+                        content = ""
+
                     main_msg = OpenAIMessage(role=anthropic_msg.role, content=content)
                     if tool_calls:
                         main_msg.tool_calls = tool_calls
@@ -512,9 +540,27 @@ class AnthropicToOpenAIConverter:
                     ):
                         content = content_parts[0]["text"]
                     else:
-                        content = content_parts
+                        # 多个内容部分，确保格式正确
+                        # content_parts 应该已经是 list[dict]，符合 OpenAIMessageContent 的格式
+                        # 但需要确保每个字典都有正确的字段
+                        validated_parts = []
+                        for part in content_parts:
+                            if isinstance(part, dict):
+                                # 确保至少有 type 字段
+                                if "type" not in part:
+                                    # 如果没有 type，默认为 text
+                                    part = {"type": "text", "text": str(part)}
+                                validated_parts.append(part)
+                            else:
+                                # 转换为字典
+                                validated_parts.append({"type": "text", "text": str(part)})
+                        content = validated_parts if validated_parts else None
 
                 # 创建OpenAI消息
+                # 如果有tool_calls但没有content，设置content为空字符串（上游API不接受content=null）
+                if content is None and tool_calls:
+                    content = ""
+
                 openai_msg = OpenAIMessage(role=anthropic_msg.role, content=content)
 
                 # 如果有工具调用，添加到消息中

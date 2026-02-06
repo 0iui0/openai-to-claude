@@ -192,6 +192,16 @@ class ModelConfig(BaseModel):
         description="长上下文处理模型", default="claude-sonnet-4-5"
     )
     web_search: str = Field(description="网络搜索模型", default="claude-sonnet-4-5")
+    fallback_models: list[str] = Field(
+        description="当遇到403权限错误时的备选模型列表（按优先级顺序）",
+        default=[
+            "claude-sonnet-4-5",
+            "deepseek-v3.2-exp",
+            "glm-4.7",
+            "qwen3-coder-plus",
+            "gpt-5.2",
+        ],
+    )
 
 
 class ParameterOverridesConfig(BaseModel):

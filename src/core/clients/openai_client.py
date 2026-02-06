@@ -254,6 +254,37 @@ class OpenAIServiceClient:
             f"发送OpenAI流式请求 - URL: {url}, Model: {request_dict.get('model', 'unknown')}, Messages: {len(request_dict.get('messages', []))}, Stream: True"
         )
 
+        # 记录请求体用于调试（只记录messages数量和结构）
+        messages = request_dict.get("messages", [])
+        for idx, msg in enumerate(messages):
+            content = msg.get("content")
+            content_type = type(content).__name__
+            if isinstance(content, list):
+                content_preview = f"[list with {len(content)} items]"
+                if len(content) > 0:
+                    first_item = content[0]
+                    if isinstance(first_item, dict):
+                        first_item_type = f"dict with keys: {list(first_item.keys())}"
+                    else:
+                        first_item_type = type(first_item).__name__
+                    content_preview += f" first item: {first_item_type}"
+            elif isinstance(content, str):
+                content_preview = f"{content[:50]}..."
+            else:
+                content_preview = str(content)[:50]
+            bound_logger.info(f"  Message[{idx}] role={msg.get('role')}, content_type={content_type}, content={content_preview}")
+
+        # 打印完整请求体的JSON（用于调试）
+        import json
+        try:
+            request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
+            # 截断过长的请求体
+            if len(request_json) > 2000:
+                request_json = request_json[:2000] + "...(truncated)"
+            bound_logger.info(f"流式请求体预览: {request_json}")
+        except Exception as e:
+            bound_logger.error(f"无法序列化请求体: {e}")
+
         try:
             async with self.client.stream(
                 "POST",

@@ -141,7 +141,7 @@ class MessagesHandler:
         request_id: str | None = None,
         max_retries: int = 3,
     ):
-        """发送请求并在配额用尽时自动重试
+        """发送请求并在配额用尽时自动重试，支持403权限错误的模型回退
 
         Args:
             openai_request: OpenAI 请求对象
@@ -155,37 +155,77 @@ class MessagesHandler:
             HTTPException: 如果所有重试都失败
         """
         from src.common.logging import get_logger_with_request_id
+        from src.config.settings import get_config
 
         bound_logger = get_logger_with_request_id(request_id)
         last_error = None
 
-        for attempt in range(max_retries):
-            try:
-                return await self.client.send_request(
-                    openai_request, request_id=request_id
-                )
+        # 获取当前请求的模型和回退列表
+        current_model = openai_request.model
+        config = await get_config()
+        fallback_models = config.models.fallback_models
 
-            except OpenAIClientError as e:
-                last_error = e
-                bound_logger.warning(
-                    f"请求失败 (尝试 {attempt + 1}/{max_retries}) - Status: {e.status_code}"
-                )
+        # 构建模型尝试列表：当前模型 + 回退模型列表
+        models_to_try = [current_model] + [m for m in fallback_models if m != current_model]
 
-                # 如果有轮换器，尝试切换 key 并重试 (使用 request_id 作为 session_id)
-                if self.key_rotator and attempt < max_retries - 1:
-                    await self._handle_client_error_with_retry(e, request_id=request_id or "default")
-                    # 继续下一次尝试
-                    continue
-                else:
-                    # 没有轮换器或已达最大重试次数，抛出错误
-                    raise
+        # 对每个模型进行尝试
+        for model_idx, model_to_try in enumerate(models_to_try):
+            # 更新请求模型
+            openai_request.model = model_to_try
 
-        # 所有重试都失败
+            # 对当前模型进行多次重试
+            for attempt in range(max_retries):
+                try:
+                    # 如果不是原始模型，记录日志
+                    if model_idx > 0:
+                        bound_logger.info(
+                            f"尝试回退模型 {model_idx}/{len(models_to_try)}: {current_model} -> {model_to_try}"
+                        )
+
+                    response = await self.client.send_request(
+                        openai_request, request_id=request_id
+                    )
+
+                    # 如果使用了回退模型，记录成功
+                    if model_idx > 0:
+                        bound_logger.info(
+                            f"回退模型 {model_to_try} 成功响应"
+                        )
+
+                    return response
+
+                except OpenAIClientError as e:
+                    last_error = e
+                    is_permission_error = (e.status_code == 403)
+
+                    bound_logger.warning(
+                        f"请求失败 (模型: {model_to_try}, 尝试 {attempt + 1}/{max_retries}) - Status: {e.status_code}"
+                    )
+
+                    # 如果是权限错误，不继续重试当前模型，直接尝试下一个模型
+                    if is_permission_error:
+                        bound_logger.warning(
+                            f"检测到403权限错误，模型 {model_to_try} 无权限，尝试下一个模型"
+                        )
+                        break  # 跳出当前模型的retry循环，进入下一个模型
+
+                    # 如果有轮换器且不是权限错误，尝试切换 key 并重试
+                    if self.key_rotator and attempt < max_retries - 1:
+                        await self._handle_client_error_with_retry(e, request_id=request_id or "default")
+                        # 继续当前模型的重试
+                        continue
+                    else:
+                        # 没有轮换器或已达最大重试次数，跳出当前模型循环
+                        break
+
+        # 所有模型和重试都失败
+        error_msg = f"所有模型尝试均失败: {', '.join(models_to_try)}"
+        bound_logger.error(error_msg)
         raise HTTPException(
             status_code=last_error.error_response.status if last_error else 500,
             detail=last_error.error_response.model_dump(exclude_none=True)
             if last_error
-            else {"error": {"message": "所有重试都失败"}},
+            else {"error": {"message": error_msg}},
         )
 
     async def process_message(
