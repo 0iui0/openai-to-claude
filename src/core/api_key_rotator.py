@@ -359,7 +359,11 @@ class APIKeyRotator:
 
     def mark_key_failure(self, error_message: str | None = None):
         """标记当前key失败"""
-        current_key = self.get_current_key()
+        if self.current_key_index is None:
+            logger.error("无法标记密钥失败：current_key_index 为 None")
+            return
+
+        current_key = self.api_keys[self.current_key_index]
         current_key.mark_failure(error_message)
 
     def mark_key_success(self, tokens_used: int = 0):
@@ -368,13 +372,32 @@ class APIKeyRotator:
         Args:
             tokens_used: 本次请求使用的 tokens 数量
         """
-        current_key = self.get_current_key()
+        if self.current_key_index is None:
+            logger.error("无法标记密钥成功：current_key_index 为 None")
+            return
+
+        current_key = self.api_keys[self.current_key_index]
         current_key.mark_success(tokens_used)
 
     def mark_key_quota_exhausted(self, error_message: str | None = None):
         """标记当前key配额用尽并切换到下一个可用key"""
-        current_key = self.get_current_key()
+        # 直接使用 current_key_index，避免触发密钥选择逻辑（防止竞态条件）
+        if self.current_key_index is None:
+            logger.error("无法标记密钥配额用尽：current_key_index 为 None")
+            raise RuntimeError("无法标记密钥配额用尽：current_key_index 为 None")
+
+        current_key = self.api_keys[self.current_key_index]
         current_key.mark_quota_exhausted(error_message)
+
+        # 从会话映射中移除该密钥（如果存在）
+        sessions_to_remove = [
+            session_id
+            for session_id, key_idx in self.session_key_mapping.items()
+            if key_idx == self.current_key_index
+        ]
+        for session_id in sessions_to_remove:
+            del self.session_key_mapping[session_id]
+            logger.debug(f"从会话映射中移除密钥 - Session: {session_id[:8]}..., Key: [{current_key.name}]")
 
         # 切换到下一个可用的key
         self._switch_to_next_available_key()
