@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
@@ -99,20 +99,6 @@ app.include_router(health_router)
 app.include_router(messages_router)
 app.include_router(responses_router)
 
-
-@app.websocket("/v1/responses")
-async def responses_websocket(websocket: WebSocket):
-    """Accept WebSocket then immediately close so Codex falls back to HTTPS."""
-    import json
-    await websocket.accept()
-    await websocket.send_json({
-        "type": "error",
-        "error": {
-            "type": "server_error",
-            "message": "Server only supports HTTPS Responses API. Use HTTP POST to /v1/responses.",
-        },
-    })
-    await websocket.close(code=4000, reason="HTTPS fallback preferred")
 
 @app.get("/")
 async def root():

@@ -37,7 +37,36 @@ def _convert_responses_input_to_messages(body: dict) -> list[dict]:
             messages.append({"role": "user", "content": item})
             continue
 
+        item_type = item.get("type", "")
         role = item.get("role", "")
+
+        # Responses API uses type-based items for function calls (no role field)
+        if item_type == "function_call":
+            # Convert to assistant message with tool_calls
+            call_id = item.get("call_id", item.get("id", f"call_{uuid.uuid4().hex[:24]}"))
+            tc = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments", "{}"),
+                },
+            }
+            # Merge with previous assistant message if it has tool_calls
+            if messages and messages[-1].get("role") == "assistant" and "tool_calls" in messages[-1]:
+                messages[-1]["tool_calls"].append(tc)
+            else:
+                messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+            continue
+
+        if item_type == "function_call_output":
+            # Convert to tool message
+            messages.append({
+                "role": "tool",
+                "tool_call_id": item.get("call_id", ""),
+                "content": item.get("output", ""),
+            })
+            continue
 
         if role == "user":
             content = item.get("content", "")
@@ -128,21 +157,25 @@ def _convert_responses_tools_to_chat_tools(tools: list[dict] | None) -> list[dic
     for tool in tools:
         tool_type = tool.get("type", "")
         if tool_type == "function":
-            fn = tool.get("function", {})
+            # Support both flat (Responses API) and nested (Chat Completions) formats
+            if "function" in tool:
+                fn = tool["function"]
+            else:
+                fn = tool
+            name = fn.get("name", "")
+            if not name:
+                continue
             chat_tools.append({
                 "type": "function",
                 "function": {
-                    "name": fn.get("name", ""),
+                    "name": name,
                     "description": fn.get("description", ""),
                     "parameters": fn.get("parameters", {}),
                 },
             })
-        elif tool_type == "web_search_preview" or tool_type == "web_search":
-            # Skip tools not supported by upstream
-            pass
         else:
-            # Pass through other tool types
-            chat_tools.append(tool)
+            # Skip unsupported tool types (web_search, mcp, etc.)
+            logger.debug(f"Skipping unsupported tool type: {tool_type}")
 
     return chat_tools if chat_tools else None
 
@@ -170,9 +203,13 @@ def _build_chat_request(body: dict) -> dict:
             req[key] = body[key]
 
     # Convert tools
-    tools = _convert_responses_tools_to_chat_tools(body.get("tools"))
+    raw_tools = body.get("tools")
+    tools = _convert_responses_tools_to_chat_tools(raw_tools)
     if tools:
         req["tools"] = tools
+        logger.info(f"Converted {len(raw_tools or [])} Responses API tools -> {len(tools)} Chat tools")
+    elif raw_tools:
+        logger.warning(f"All {len(raw_tools)} tools were filtered out during conversion")
 
     return req
 
@@ -323,41 +360,30 @@ class ResponsesHandler:
 
         resp_id = f"resp_{uuid.uuid4().hex[:24]}"
         model = body.get("model", "gpt-4o")
-
-        # Send initial response.created event
         created_at = int(time.time())
-        yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model, 'status': 'in_progress', 'output': []}})}\n\n"
 
-        # Send response.in_progress
+        # Initial events
+        yield f"event: response.created\ndata: {json.dumps({'type': 'response.created', 'response': {'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model, 'status': 'in_progress', 'output': []}})}\n\n"
         yield f"event: response.in_progress\ndata: {json.dumps({'type': 'response.in_progress', 'response': {'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model, 'status': 'in_progress', 'output': []}})}\n\n"
 
-        # Output item and content item IDs
+        # IDs for the message output item
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-        text_id = f"item_{uuid.uuid4().hex[:24]}"
-        output_index = 0
-        content_index = 0
 
-        # Send output_item.added
-        yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': []}})}\n\n"
-
-        # Send content_part.added
-        yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'output_index': output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
-
-        # Stream text deltas
-        # Filter out unsupported tool types before sending
-        filtered_tools = []
-        for t in chat_req.get("tools", []):
-            if t.get("type") == "function":
-                fn = t.get("function", {})
-                if fn.get("name"):
-                    filtered_tools.append(t)
-        if filtered_tools:
-            chat_req["tools"] = filtered_tools
-        elif "tools" in chat_req:
-            del chat_req["tools"]
+        # Track state: text output at index 0, tool calls get increasing indices
         full_text = ""
         input_tokens = 0
         output_tokens = 0
+        # Accumulate tool calls: {index: {id, name, arguments}}
+        tool_calls_acc: dict[int, dict] = {}
+        next_output_index = 0  # will be set after we emit the message item
+
+        # Emit the message output item (for text content)
+        msg_output_index = 0
+        next_output_index = 1
+        content_index = 0
+
+        yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': msg_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': []}})}\n\n"
+        yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'output_index': msg_output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
 
         async for chunk in self.client.send_raw_streaming_request(chat_req, request_id=request_id):
             if chunk.startswith("data: "):
@@ -366,7 +392,6 @@ class ResponsesHandler:
                     break
                 try:
                     data = json.loads(data_str)
-                    # Extract usage from streaming chunks
                     if data.get("usage"):
                         u = data["usage"]
                         input_tokens = u.get("prompt_tokens", input_tokens)
@@ -374,28 +399,60 @@ class ResponsesHandler:
 
                     for choice in data.get("choices", []):
                         delta = choice.get("delta", {})
-                        text = delta.get("content", "")
+
+                        # Text deltas
+                        text = delta.get("content")
                         if text:
                             full_text += text
-                            yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'output_index': output_index, 'content_index': content_index, 'delta': text})}\n\n"
+                            yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'output_index': msg_output_index, 'content_index': content_index, 'delta': text})}\n\n"
 
-                        # Handle tool calls in streaming
-                        tool_calls = delta.get("tool_calls", [])
-                        for tc in tool_calls:
+                        # Tool call deltas
+                        tc_deltas = delta.get("tool_calls", [])
+                        for tc in tc_deltas:
+                            tc_index = tc.get("index", 0)
                             fn_delta = tc.get("function", {})
-                            if fn_delta.get("name"):
-                                yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': output_index, 'item_id': msg_id, 'call_id': tc.get('id', ''), 'delta': fn_delta.get('arguments', '')})}\n\n"
+                            tc_id = tc.get("id", "")
+
+                            # New tool call (has id and name)
+                            if tc_id and fn_delta.get("name"):
+                                tool_output_index = next_output_index
+                                next_output_index += 1
+                                initial_args = fn_delta.get("arguments", "")
+                                tool_calls_acc[tc_index] = {
+                                    "id": tc_id,
+                                    "name": fn_delta["name"],
+                                    "arguments": initial_args,
+                                    "output_index": tool_output_index,
+                                }
+                                # Emit output_item.added for function_call
+                                yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': tool_output_index, 'item': {'type': 'function_call', 'id': tc_id, 'call_id': tc_id, 'name': fn_delta['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
+                                if initial_args:
+                                    yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': tool_output_index, 'item_id': tc_id, 'call_id': tc_id, 'delta': initial_args})}\n\n"
+                                bound_logger.debug(f"Tool call started: {fn_delta['name']} at output_index={tool_output_index}")
+                            # Continuing tool call (arguments only)
+                            elif tc_index in tool_calls_acc and fn_delta.get("arguments"):
+                                acc = tool_calls_acc[tc_index]
+                                acc["arguments"] += fn_delta["arguments"]
+                                yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': acc['output_index'], 'item_id': acc['id'], 'call_id': acc['id'], 'delta': fn_delta['arguments']})}\n\n"
                 except json.JSONDecodeError:
                     pass
 
-        # Send content_part.done
-        yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'output_index': output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': full_text}})}\n\n"
+        # Finalize text content part
+        yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'output_index': msg_output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': full_text}})}\n\n"
+        yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': msg_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': [{'type': 'output_text', 'text': full_text}]}})}\n\n"
 
-        # Send output_item.done
-        yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': [{'type': 'output_text', 'text': full_text}]}})}\n\n"
+        # Finalize tool call items
+        output_items = [{'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': [{'type': 'output_text', 'text': full_text}]}]
+        for tc_index in sorted(tool_calls_acc.keys()):
+            acc = tool_calls_acc[tc_index]
+            yield f"event: response.function_call_arguments.done\ndata: {json.dumps({'type': 'response.function_call_arguments.done', 'output_index': acc['output_index'], 'item_id': acc['id'], 'call_id': acc['id'], 'arguments': acc['arguments']})}\n\n"
+            tc_item = {'type': 'function_call', 'id': acc['id'], 'call_id': acc['id'], 'name': acc['name'], 'arguments': acc['arguments'], 'status': 'completed'}
+            yield f"event: response.output_item.done\ndata: {json.dumps({'type': 'response.output_item.done', 'output_index': acc['output_index'], 'item': tc_item})}\n\n"
+            output_items.append(tc_item)
+            bound_logger.info(f"Tool call completed: {acc['name']}({acc['arguments'][:200]})")
 
-        # Send response.completed
-        yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model, 'status': 'completed', 'output': [{'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': [{'type': 'output_text', 'text': full_text}]}], 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': input_tokens + output_tokens}}})}\n\n"
+        # response.completed
+        yield f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': {'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model, 'status': 'completed', 'output': output_items, 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': input_tokens + output_tokens}}})}\n\n"
 
 
 @router.post("/responses")
@@ -412,7 +469,16 @@ async def responses_endpoint(request: Request, background_tasks: BackgroundTasks
 
     try:
         body = await request.json()
-        bound_logger.debug(f"Responses API body: model={body.get('model')}, stream={body.get('stream', False)}, input_items={len(body.get('input', []))}")
+        tools = body.get("tools", [])
+        bound_logger.info(
+            f"Responses API body: model={body.get('model')}, stream={body.get('stream', False)}, "
+            f"input_items={len(body.get('input', []))}, tools={len(tools)}"
+        )
+        if tools:
+            for i, t in enumerate(tools[:5]):
+                ttype = t.get("type", "?")
+                name = t.get("name") or t.get("function", {}).get("name", "")
+                bound_logger.info(f"  tool[{i}] type={ttype} name={name}")
 
         if body.get("stream"):
             async def stream_wrapper():
