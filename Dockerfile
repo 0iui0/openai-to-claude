@@ -4,13 +4,10 @@ FROM ubuntu:24.04
 # 设置工作目录
 WORKDIR /app
 
-# 使用阿里云镜像源
-RUN cat > /etc/apt/sources.list << 'EOF'
-deb http://mirrors.aliyun.com/ubuntu/ noble main restricted universe multiverse
-deb http://mirrors.aliyun.com/ubuntu/ noble-updates main restricted universe multiverse
-deb http://mirrors.aliyun.com/ubuntu/ noble-backports main restricted universe multiverse
-deb http://mirrors.aliyun.com/ubuntu/ noble-security main restricted universe multiverse
-EOF
+# 使用阿里云镜像源（Ubuntu 24.04 DEB822格式，支持 x86 和 ARM）
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.aliyun.com/ubuntu-ports|g' /etc/apt/sources.list.d/ubuntu.sources
 
 # 安装 Python 3.12 和 pip
 RUN apt-get update && apt-get install -y \

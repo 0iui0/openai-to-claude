@@ -7,6 +7,23 @@ from typing import Any
 from ...common.token_cache import get_cached_tokens
 from loguru import logger
 
+# Import the sanitize function from request converter
+def sanitize_tool_call_id(original_id: str) -> str:
+    """清理工具调用ID，使其符合OpenAI API的格式要求"""
+    import hashlib
+    import re
+
+    if not original_id:
+        return f"tool_{int(time.time() * 1000)}"
+
+    # 检查ID是否已经符合格式要求
+    if re.match(r'^[a-zA-Z0-9_-]+$', original_id):
+        return original_id
+
+    # 如果不符合格式，生成一个新的ID
+    hash_part = hashlib.md5(original_id.encode()).hexdigest()[:8]
+    return f"tool_{hash_part}"
+
 from src.models.anthropic import (
     AnthropicContentBlock,
     AnthropicContentTypes,
@@ -252,6 +269,40 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
     state.tool_call_chunks += 1
     processed_indices: set[int] = set()
 
+    # 如果思考模式仍然激活，需要先关闭思考块
+    # 这处理了从思考内容直接转换到工具调用的情况
+    if state.thinking_started and not state.thinking_finish:
+        # 结束思考块
+        state.thinking_mode = None
+        state.thinking_finish = True
+
+        # 生成 signature_delta
+        signature_delta = AnthropicStreamContentBlock(
+            index=state.content_index,
+            delta=Delta(
+                type=AnthropicContentTypes.SIGNATURE_DELTA,
+                signature=f"{int(time.time()*1000)}",
+            ),
+        )
+        events.append(
+            format_event(
+                AnthropicStreamEventTypes.CONTENT_BLOCK_DELTA,
+                signature_delta.model_dump(exclude_none=True),
+            )
+        )
+
+        # 生成 content_block_stop
+        content_block_stop = AnthropicStreamContentBlockStop(
+            index=state.content_index,
+        )
+        events.append(
+            format_event(
+                AnthropicStreamEventTypes.CONTENT_BLOCK_STOP,
+                content_block_stop.model_dump(exclude_none=True),
+            )
+        )
+        state.content_index += 1
+
     for tool_call in delta["tool_calls"]:
         tool_call_index = tool_call.get("index", 0)
         if tool_call_index in processed_indices:
@@ -285,11 +336,9 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
                 new_content_block_index
             )
 
-            # 生成工具调用信息
-            tool_call_id = (
-                tool_call.get("id")
-                or f"call_{int(time.time() * 1000)}_{tool_call_index}"
-            )
+            # 生成工具调用信息 - 使用清理后的ID
+            raw_tool_call_id = tool_call.get("id") or f"call_{int(time.time() * 1000)}_{tool_call_index}"
+            tool_call_id = sanitize_tool_call_id(raw_tool_call_id)
             tool_call_name = (
                 tool_call.get("function", {}).get("name") or f"tool_{tool_call_index}"
             )
@@ -322,10 +371,11 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
 
             # 保存工具调用信息
             state.tool_calls[tool_call_index] = {
-                "id": tool_call_id,
+                "id": tool_call_id,  # 使用清理后的ID
                 "name": tool_call_name,
                 "arguments": "",
                 "content_block_index": new_content_block_index,
+                "raw_id": raw_tool_call_id,  # 保存原始ID以便后续映射
             }
 
         # 更新已存在的工具调用信息
@@ -341,8 +391,11 @@ def process_tool_calls(delta: dict[str, Any], state: StreamState) -> list[str]:
             ) and existing_tool_call["name"].startswith("tool_")
 
             if was_temporary:
-                existing_tool_call["id"] = tool_call["id"]
+                # 清理工具调用ID
+                raw_id = tool_call["id"]
+                existing_tool_call["id"] = sanitize_tool_call_id(raw_id)
                 existing_tool_call["name"] = tool_call["function"]["name"]
+                existing_tool_call["raw_id"] = raw_id  # 保存原始ID
 
         # 处理工具调用参数
         function_args = tool_call.get("function", {}).get("arguments")

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from src.config.settings import Config
 from src.core.clients.openai_client import OpenAIServiceClient
@@ -57,3 +57,62 @@ async def health_check(
         }
 
     return health_status
+
+
+@router.get("/api-keys/status", tags=["monitoring"])
+async def get_api_keys_status(request: Request) -> dict[str, Any]:
+    """获取所有 API Key 的状态和使用统计
+
+    返回信息包括：
+    - 当前使用的策略
+    - 每个 key 的可用性状态
+    - 使用次数、失败次数、token 使用量
+    - 当前使用的 key
+    """
+    # 从应用状态获取消息处理器（已由main.py在启动时初始化）
+    handler = request.app.state.messages_handler
+
+    if handler.key_rotator is None:
+        return {
+            "strategy": "single_key",
+            "total_keys": 1,
+            "keys": [
+                {
+                    "name": "default",
+                    "is_current": True,
+                    "is_available": True,
+                }
+            ],
+        }
+
+    # 获取轮换器的状态
+    status = handler.key_rotator.get_status()
+
+    # 添加额外的时间戳信息
+    status["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    return status
+
+
+@router.post("/api-keys/reset", tags=["monitoring"])
+async def reset_api_keys(request: Request) -> dict[str, Any]:
+    """重置所有 API Key 的状态（清除配额耗尽和限流标记）
+
+    用于手动恢复因临时错误被错误标记为不可用的 key
+    """
+    handler = request.app.state.messages_handler
+
+    if handler.key_rotator is None:
+        return {"status": "ok", "message": "单key模式，无需重置"}
+
+    handler.key_rotator.reset_all_keys()
+
+    # 更新客户端凭证到重置后的当前key
+    current_key = handler.key_rotator.get_current_key()
+    handler.client.update_credentials(current_key.api_key, current_key.base_url)
+
+    return {
+        "status": "ok",
+        "message": "所有API Key状态已重置",
+        "current_key": current_key.name,
+    }

@@ -28,6 +28,37 @@ from src.models.openai import (
 # 全局缓存配置对象
 
 
+def sanitize_tool_call_id(original_id: str) -> str:
+    """清理工具调用ID，使其符合OpenAI API的格式要求
+
+    OpenAI要求tool_call.id匹配模式^[a-zA-Z0-9_-]+
+    如果原始ID包含非法字符，则生成一个新的符合要求的ID
+
+    Args:
+        original_id: 原始工具调用ID
+
+    Returns:
+        清理后的或新生成的工具调用ID
+    """
+    if not original_id:
+        import time
+        return f"tool_{int(time.time() * 1000)}"
+
+    # 检查ID是否已经符合格式要求
+    import re
+    if re.match(r'^[a-zA-Z0-9_-]+$', original_id):
+        return original_id
+
+    # 如果不符合格式，生成一个新的ID
+    # 使用哈希确保相同原始ID总是生成相同的新ID（保持一致性）
+    import hashlib
+    import time
+
+    # 使用原始ID的哈希值+时间戳生成唯一但确定的新ID
+    hash_part = hashlib.md5(original_id.encode()).hexdigest()[:8]
+    return f"tool_{hash_part}"
+
+
 class AnthropicToOpenAIConverter:
     """将Anthropic请求转换为OpenAI格式"""
 
@@ -59,6 +90,14 @@ class AnthropicToOpenAIConverter:
         # 获取绑定了请求ID的logger
         from src.common.logging import get_logger_with_request_id
         bound_logger = get_logger_with_request_id(request_id)
+
+        # 模型别名替换：将不支持的模型名映射为可用模型
+        if original_model and original_model in config.models.model_aliases:
+            alias = config.models.model_aliases[original_model]
+            bound_logger.info(
+                f"模型别名替换: {original_model} -> {alias}"
+            )
+            original_model = alias
 
         # 规范化模型名称：移除日期后缀（如 claude-sonnet-4-5-20250929 -> claude-sonnet-4-5）
         normalized_model = original_model
@@ -201,6 +240,19 @@ class AnthropicToOpenAIConverter:
         # 转换消息列表
         messages = AnthropicToOpenAIConverter._convert_messages(anthropic_request)
 
+        # 如果启用了thinking模式，确保所有带tool_calls的assistant消息都有reasoning_content
+        # 某些上游API要求当thinking启用时，所有使用工具的assistant消息都必须包含reasoning_content
+        think_enabled = (
+            anthropic_request.thinking is not None
+            and isinstance(anthropic_request.thinking, dict)
+            and anthropic_request.thinking.get("type") == "enabled"
+        )
+
+        if think_enabled:
+            messages = AnthropicToOpenAIConverter._ensure_reasoning_content_for_tool_calls(
+                messages
+            )
+
         # 提取system提示
         system_prompt = AnthropicToOpenAIConverter._extract_system_prompt(
             anthropic_request.system
@@ -270,6 +322,7 @@ class AnthropicToOpenAIConverter:
             tool_choice=AnthropicToOpenAIConverter._convert_tool_choice(
                 anthropic_request.tool_choice
             ),
+            think=think_enabled,
             # frequency_penalty=None,  # Anthropic没有直接对应的参数
             # presence_penalty=None,  # Anthropic没有直接对应的参数
             # logprobs=False,  # Anthropic默认不返回logprobs
@@ -406,14 +459,16 @@ class AnthropicToOpenAIConverter:
             content_parts = []
             tool_calls = []
             tool_results = []
+            reasoning_content = ""  # 用于收集推理内容
 
             for content_block in anthropic_msg.content:
                 if isinstance(content_block, dict):
                     # 处理字典格式的内容块
                     if content_block.get("type") == "tool_use":
                         # 将tool_use转换为OpenAI的tool_calls格式
+                        original_id = content_block.get("id", "")
                         tool_call = {
-                            "id": content_block.get("id", ""),
+                            "id": sanitize_tool_call_id(original_id),
                             "type": "function",
                             "function": {
                                 "name": content_block.get("name", ""),
@@ -430,12 +485,18 @@ class AnthropicToOpenAIConverter:
                             tool_result_content = json.dumps(
                                 tool_result_content, ensure_ascii=False
                             )
+                        original_id = content_block.get("tool_use_id", "")
                         tool_results.append(
                             {
-                                "tool_call_id": content_block.get("tool_use_id", ""),
+                                "tool_call_id": sanitize_tool_call_id(original_id),
                                 "content": tool_result_content,
                             }
                         )
+                    elif content_block.get("type") == "thinking":
+                        # 收集思考内容，作为reasoning_content用于有tool_calls的消息
+                        thinking_text = content_block.get("thinking", "")
+                        if thinking_text:
+                            reasoning_content += thinking_text
                     elif content_block.get("type") in ["text", "image_url"]:
                         # 只保留OpenAI支持的内容类型
                         content_parts.append(content_block)
@@ -443,8 +504,9 @@ class AnthropicToOpenAIConverter:
                     # 处理Pydantic模型对象
                     if content_block.type == "tool_use":
                         # 将tool_use转换为OpenAI的tool_calls格式
+                        original_id = getattr(content_block, "id", "")
                         tool_call = {
-                            "id": getattr(content_block, "id", ""),
+                            "id": sanitize_tool_call_id(original_id),
                             "type": "function",
                             "function": {
                                 "name": getattr(content_block, "name", ""),
@@ -462,14 +524,18 @@ class AnthropicToOpenAIConverter:
                             tool_result_content = json.dumps(
                                 tool_result_content, ensure_ascii=False
                             )
+                        original_id = getattr(content_block, "tool_use_id", "")
                         tool_results.append(
                             {
-                                "tool_call_id": getattr(
-                                    content_block, "tool_use_id", ""
-                                ),
+                                "tool_call_id": sanitize_tool_call_id(original_id),
                                 "content": tool_result_content,
                             }
                         )
+                    elif content_block.type == "thinking":
+                        # 收集思考内容，作为reasoning_content用于有tool_calls的消息
+                        thinking_text = getattr(content_block, "thinking", "")
+                        if thinking_text:
+                            reasoning_content += thinking_text
                     elif content_block.type in ["text", "image_url"]:
                         # 只保留OpenAI支持的内容类型
                         content_parts.append(content_block.model_dump())
@@ -515,6 +581,10 @@ class AnthropicToOpenAIConverter:
                     main_msg = OpenAIMessage(role=anthropic_msg.role, content=content)
                     if tool_calls:
                         main_msg.tool_calls = tool_calls
+                        # 如果有tool_calls且收集了思考内容，添加为reasoning_content
+                        # 这对于某些需要推理内容的API很重要（如启用了thinking模式的模型）
+                        if reasoning_content and reasoning_content.strip():
+                            main_msg.reasoning_content = reasoning_content.strip()
                     messages.append(main_msg)
 
                 # 然后为每个tool_result创建独立的tool消息
@@ -566,6 +636,10 @@ class AnthropicToOpenAIConverter:
                 # 如果有工具调用，添加到消息中
                 if tool_calls:
                     openai_msg.tool_calls = tool_calls
+                    # 如果有tool_calls且收集了思考内容，添加为reasoning_content
+                    # 这对于某些需要推理内容的API很重要（如启用了thinking模式的模型）
+                    if reasoning_content and reasoning_content.strip():
+                        openai_msg.reasoning_content = reasoning_content.strip()
 
                 return openai_msg
         else:
@@ -661,6 +735,10 @@ class AnthropicToOpenAIConverter:
         此方法会移除没有对应tool消息的assistant消息中的tool_calls序列。
         同时也会移除没有对应assistant消息的独立tool消息。
 
+        改进策略：两遍扫描
+        1. 第一遍：建立tool_call_id到assistant消息索引的映射
+        2. 第二遍：只保留有完整对应关系的消息
+
         Args:
             messages: 原始消息列表
 
@@ -670,80 +748,148 @@ class AnthropicToOpenAIConverter:
         if not messages:
             return messages
 
+        # 第一遍：建立所有tool_call的映射关系
+        tool_call_to_assistant_index: dict[str, int] = {}
+        assistant_tool_calls: dict[int, set[str]] = {}  # assistant_index -> set of tool_call_ids
+
+        for i, msg in enumerate(messages):
+            if msg.role == "assistant" and msg.tool_calls:
+                tool_call_ids = set()
+                for call in msg.tool_calls:
+                    call_id = call.get("id")
+                    if call_id:
+                        tool_call_to_assistant_index[call_id] = i
+                        tool_call_ids.add(call_id)
+                assistant_tool_calls[i] = tool_call_ids
+
+        # 第二遍：验证每个tool消息是否有对应的assistant消息
+        valid_tool_call_ids: set[str] = set()
+
+        for i, msg in enumerate(messages):
+            if msg.role == "tool" and msg.tool_call_id:
+                # 检查这个tool_call_id是否有对应的assistant消息
+                if msg.tool_call_id in tool_call_to_assistant_index:
+                    valid_tool_call_ids.add(msg.tool_call_id)
+
+        # 第三遍：构建过滤后的消息列表
         filtered_messages = []
         i = 0
 
         while i < len(messages):
             current_msg = messages[i]
 
-            # 如果当前消息是assistant且有tool_calls
-            if (
-                current_msg.role == "assistant"
-                and current_msg.tool_calls
-                and len(current_msg.tool_calls) > 0
-            ):
+            # 如果是assistant消息且有tool_calls
+            if current_msg.role == "assistant" and current_msg.tool_calls:
+                # 检查这个assistant消息的tool_calls是否都有对应的tool消息
+                assistant_index = i
+                if assistant_index in assistant_tool_calls:
+                    tool_call_ids = assistant_tool_calls[assistant_index]
 
-                # 检查后续消息是否有对应的tool消息
-                tool_call_ids = {
-                    call.get("id") for call in current_msg.tool_calls if call.get("id")
-                }
-                found_tool_ids = set()
+                    # 查找后续的tool消息
+                    j = i + 1
+                    found_tool_ids = set()
+                    while j < len(messages) and messages[j].role == "tool":
+                        tool_msg = messages[j]
+                        if tool_msg.tool_call_id in tool_call_ids:
+                            if tool_msg.tool_call_id in valid_tool_call_ids:
+                                found_tool_ids.add(tool_msg.tool_call_id)
+                        j += 1
 
-                # 查找后续的tool消息
-                j = i + 1
-                while j < len(messages) and messages[j].role == "tool":
-                    tool_msg = messages[j]
-                    if tool_msg.tool_call_id and tool_msg.tool_call_id in tool_call_ids:
-                        found_tool_ids.add(tool_msg.tool_call_id)
-                    j += 1
-
-                # 如果所有tool_calls都有对应的tool消息，保留完整序列
-                if found_tool_ids == tool_call_ids:
-                    # 添加assistant消息
-                    filtered_messages.append(current_msg)
-                    # 添加对应的tool消息
-                    for k in range(i + 1, j):
-                        if messages[k].role == "tool":
-                            filtered_messages.append(messages[k])
-                    i = j  # 跳过已处理的tool消息
+                    # 只有所有tool_calls都有有效对应的tool消息时才保留
+                    if found_tool_ids == tool_call_ids:
+                        filtered_messages.append(current_msg)
+                        # 添加对应的tool消息
+                        for k in range(i + 1, j):
+                            if messages[k].role == "tool":
+                                filtered_messages.append(messages[k])
+                        i = j
+                    else:
+                        # 不完整的序列，跳过
+                        logger.debug(
+                            f"过滤不完整的tool_calls序列: 期望{len(tool_call_ids)}个tool消息，实际找到{len(found_tool_ids)}个"
+                        )
+                        i = j
                 else:
-                    # 不完整的tool_calls序列，跳过整个序列
-                    logger.debug(
-                        f"过滤不完整的tool_calls序列: 期望{len(tool_call_ids)}个tool消息，实际找到{len(found_tool_ids)}个"
-                    )
-                    i = j  # 跳过整个不完整序列
-            # 如果当前消息是独立的tool消息（前面没有对应的assistant消息）
+                    # 没有tool_calls的assistant消息，直接添加
+                    filtered_messages.append(current_msg)
+                    i += 1
+
+            # 如果是tool消息，需要检查是否有对应的assistant消息
             elif current_msg.role == "tool":
-                # 检查前面是否有对应的assistant消息
-                has_corresponding_assistant = False
-                for k in range(i - 1, -1, -1):
-                    prev_msg = messages[k]
-                    if prev_msg.role == "assistant" and prev_msg.tool_calls:
-                        # 检查tool_call_id是否匹配
-                        for call in prev_msg.tool_calls:
-                            if call.get("id") == current_msg.tool_call_id:
-                                has_corresponding_assistant = True
+                # 检查tool_call_id是否在有效列表中
+                if current_msg.tool_call_id in valid_tool_call_ids:
+                    # 这个tool消息有对应的assistant，应该被保留
+                    # 但由于上面的逻辑已经添加了配对的tool消息，这里只处理漏掉的情况
+                    # 检查是否已经被添加过（避免重复）
+                    if not filtered_messages or filtered_messages[-1] != current_msg:
+                        # 再检查一下前面是否有对应的assistant消息
+                        has_corresponding = False
+                        for k in range(len(filtered_messages) - 1, -1, -1):
+                            prev_msg = filtered_messages[k]
+                            if prev_msg.role == "assistant" and prev_msg.tool_calls:
+                                for call in prev_msg.tool_calls:
+                                    if call.get("id") == current_msg.tool_call_id:
+                                        has_corresponding = True
+                                        break
+                                if has_corresponding:
+                                    break
+                            elif prev_msg.role != "tool":
                                 break
-                        if has_corresponding_assistant:
-                            break
-                    # 如果遇到非tool消息且不是assistant，则停止向前查找
-                    elif prev_msg.role != "tool":
-                        break
 
-                # 只有当有对应的assistant消息时才保留tool消息
-                if has_corresponding_assistant:
-                    filtered_messages.append(current_msg)
+                        if has_corresponding:
+                            filtered_messages.append(current_msg)
+                    i += 1
                 else:
+                    # 没有对应assistant的tool消息，过滤掉
                     logger.debug(
                         f"过滤没有对应assistant消息的独立tool消息: {current_msg.tool_call_id}"
                     )
-                i += 1
+                    i += 1
+
+            # 普通消息，直接添加
             else:
-                # 普通消息，直接添加
                 filtered_messages.append(current_msg)
                 i += 1
 
         return filtered_messages
+
+    @staticmethod
+    def _ensure_reasoning_content_for_tool_calls(
+        messages: list[OpenAIMessage],
+    ) -> list[OpenAIMessage]:
+        """确保所有带tool_calls的assistant消息都有reasoning_content
+
+        当thinking模式启用时，某些上游API要求所有使用工具的assistant消息都必须包含reasoning_content。
+        此方法会为缺少reasoning_content的assistant消息添加占位符内容。
+
+        Args:
+            messages: OpenAI格式的消息列表
+
+        Returns:
+            更新后的消息列表
+        """
+        updated_messages = []
+        for msg in messages:
+            # 创建消息的副本以避免修改原始消息
+            updated_msg = msg.model_copy()
+
+            # 如果是assistant消息且有tool_calls但没有reasoning_content
+            if (
+                updated_msg.role == "assistant"
+                and updated_msg.tool_calls
+                and len(updated_msg.tool_calls) > 0
+                and not updated_msg.reasoning_content
+            ):
+                # 添加占位符reasoning_content
+                # 使用空字符串表示"此消息是工具调用，没有单独的推理内容"
+                updated_msg.reasoning_content = ""
+                logger.debug(
+                    f"为assistant消息添加reasoning_content占位符 (tool_calls数量: {len(updated_msg.tool_calls)})"
+                )
+
+            updated_messages.append(updated_msg)
+
+        return updated_messages
 
 
 async def validate_anthropic_request(

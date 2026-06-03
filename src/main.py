@@ -1,10 +1,11 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from src.api.handlers import router as messages_router
+from src.api.responses_handler import router as responses_router
 from src.api.middleware.auth import APIKeyMiddleware
 from src.api.middleware.timing import setup_middlewares
 from src.api.routes import router as health_router
@@ -30,7 +31,9 @@ async def lifespan(app: FastAPI):
     configure_logging(config.logging)
 
     # 创建配置化的消息处理器并缓存到应用中
+    from src.api.responses_handler import ResponsesHandler
     app.state.messages_handler = await MessagesHandler.create(config)
+    app.state.responses_handler = await ResponsesHandler.create(config)
 
     # 配置重载回调函数
     async def on_config_reload():
@@ -44,6 +47,7 @@ async def lifespan(app: FastAPI):
 
             # 重新创建消息处理器
             app.state.messages_handler = await MessagesHandler.create(new_config)
+            app.state.responses_handler = await ResponsesHandler.create(new_config)
 
             logger.info("配置热重载完成，服务已更新")
         except Exception as e:
@@ -93,7 +97,22 @@ app.add_middleware(APIKeyMiddleware, api_key=config.api_key)
 
 app.include_router(health_router)
 app.include_router(messages_router)
+app.include_router(responses_router)
 
+
+@app.websocket("/v1/responses")
+async def responses_websocket(websocket: WebSocket):
+    """Accept WebSocket then immediately close so Codex falls back to HTTPS."""
+    import json
+    await websocket.accept()
+    await websocket.send_json({
+        "type": "error",
+        "error": {
+            "type": "server_error",
+            "message": "Server only supports HTTPS Responses API. Use HTTP POST to /v1/responses.",
+        },
+    })
+    await websocket.close(code=4000, reason="HTTPS fallback preferred")
 
 @app.get("/")
 async def root():

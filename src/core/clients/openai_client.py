@@ -279,8 +279,8 @@ class OpenAIServiceClient:
         try:
             request_json = json.dumps(request_dict, ensure_ascii=False, indent=2)
             # 截断过长的请求体
-            if len(request_json) > 2000:
-                request_json = request_json[:2000] + "...(truncated)"
+            if len(request_json) > 20000:
+                request_json = request_json[:20000] + "...(truncated)"
             bound_logger.info(f"流式请求体预览: {request_json}")
         except Exception as e:
             bound_logger.error(f"无法序列化请求体: {e}")

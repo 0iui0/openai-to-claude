@@ -71,12 +71,12 @@ class TestAPIKeyRotator:
         # 测试各种配额错误
         assert rotator.is_quota_error(429) is True  # Rate limit
         assert rotator.is_quota_error(402) is True  # Payment required
-        assert rotator.is_quota_error(500, "quota exceeded") is True
-        assert rotator.is_quota_error(500, "insufficient credits") is True
-        assert rotator.is_quota_error(500, "balance too low") is True
+        assert rotator.is_quota_error(429, "quota exceeded") is True
+        assert rotator.is_quota_error(402, "insufficient credits") is True
 
-        # 测试非配额错误
+        # 500不应视为配额错误（服务端错误不应导致key永久禁用）
         assert rotator.is_quota_error(500) is False
+        assert rotator.is_quota_error(500, "quota exceeded") is False
         assert rotator.is_quota_error(500, "internal server error") is False
 
     def test_handle_error_with_quota_error(self):

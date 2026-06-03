@@ -141,7 +141,8 @@ class OpenAIToAnthropicConverter:
         message_data = first_choice_data.get("message", {})
 
         # 处理推理内容 - 作为独立的thinking类型内容块
-        reasoning_content = message_data.get("reasoning_content")
+        # 某些模型（如 Nemotron）将文本输出放在 reasoning 字段而非 content 字段
+        reasoning_content = message_data.get("reasoning_content") or message_data.get("reasoning")
         if (
             reasoning_content
             and isinstance(reasoning_content, str)
@@ -156,7 +157,7 @@ class OpenAIToAnthropicConverter:
             )
 
         # 处理普通内容 - 作为独立的text类型内容块
-        content_str = message_data.get("content", "")
+        content_str = message_data.get("content") or ""
         if content_str and isinstance(content_str, str) and content_str.strip():
             # 检查content中是否包含<think>标签
             if "<think>" in content_str and "</think>" in content_str:
@@ -198,6 +199,13 @@ class OpenAIToAnthropicConverter:
                         type=AnthropicContentTypes.TEXT, text=content_str.strip()
                     )
                 )
+        elif reasoning_content and isinstance(reasoning_content, str) and reasoning_content.strip():
+            # 某些模型（如 Nemotron）只有 reasoning 没有 content
+            content_blocks.append(
+                AnthropicContentBlock(
+                    type=AnthropicContentTypes.TEXT, text=reasoning_content.strip()
+                )
+            )
 
         # 处理工具调用
         if choice.message.tool_calls:

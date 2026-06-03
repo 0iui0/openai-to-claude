@@ -82,6 +82,9 @@ class OpenAIKeyConfig(BaseModel):
     daily_limit: float | None = Field(None, description="每日限额（元）")
     base_url: str | None = Field(None, description="API基础URL（可选，覆盖全局配置）")
     weight: float = Field(1.0, description="权重，用于加权随机选择")
+    price_input: float | None = Field(None, description="输入单价（元/1K tokens）")
+    price_output: float | None = Field(None, description="输出单价（元/1K tokens）")
+    model: str | None = Field(None, description="模型覆盖，使用此key时固定使用该模型名（如本地vLLM固定模型）")
 
 
 class OpenAIConfig(BaseModel):
@@ -117,6 +120,9 @@ class OpenAIConfig(BaseModel):
                     "daily_limit": key_config.daily_limit,
                     "base_url": key_config.base_url or self.base_url,
                     "weight": key_config.weight,
+                    "price_input": key_config.price_input,
+                    "price_output": key_config.price_output,
+                    "model": key_config.model,
                 }
                 for key_config in self.api_keys
             ]
@@ -176,30 +182,36 @@ class ModelConfig(BaseModel):
     """
 
     default: str = Field(
-        description="默认通用模型", default="claude-sonnet-4-5"
+        description="默认通用模型", default="glm-5"
     )
     small: str = Field(
-        description="轻量级模型，用于简单任务", default="claude-sonnet-4-5"
+        description="轻量级模型，用于简单任务", default="glm-5"
     )
     tool: str = Field(
-        description="工具使用专用模型", default="claude-sonnet-4-5"
+        description="工具使用专用模型", default="glm-5"
     )
     think: str = Field(
         description="深度思考模型，用于复杂推理任务",
-        default="claude-sonnet-4-5",
+        default="glm-5",
     )
     long_context: str = Field(
-        description="长上下文处理模型", default="claude-sonnet-4-5"
+        description="长上下文处理模型", default="glm-5"
     )
-    web_search: str = Field(description="网络搜索模型", default="claude-sonnet-4-5")
+    web_search: str = Field(description="网络搜索模型", default="glm-5")
+    model_aliases: dict[str, str] = Field(
+        description="模型别名映射，将不支持的模型名替换为可用模型（键为原始名，值为替换名）",
+        default={
+            "claude-opus-4-7": "claude-sonnet-4-6",
+            "claude-opus-4-20250514": "claude-sonnet-4-6",
+        },
+    )
     fallback_models: list[str] = Field(
         description="当遇到403权限错误时的备选模型列表（按优先级顺序）",
         default=[
-            "claude-sonnet-4-5",
-            "deepseek-v3.2-exp",
-            "glm-4.7",
-            "qwen3-coder-plus",
-            "gpt-5.2",
+            "glm-5.1",
+            "glm-5",
+            "kimi-k2.5",
+            "qwen3.6-plus",
         ],
     )
 

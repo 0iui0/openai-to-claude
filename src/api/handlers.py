@@ -49,10 +49,10 @@ class MessagesHandler:
                 base_url=api_keys_config[0]["base_url"],
             )
         else:
-            # 多个 keys，使用轮换器（默认使用会话粘性策略）
-            self.key_rotator = APIKeyRotator(api_keys_config, strategy="session_affinity")
-            # 使用轮换器选择的当前 key 初始化客户端（使用默认会话）
-            current_key = self.key_rotator.get_current_key(session_id="default")
+            # 多个 keys，使用轮换器（使用轮询策略实现负载均衡）
+            self.key_rotator = APIKeyRotator(api_keys_config, strategy="round_robin")
+            # 使用轮换器选择的当前 key 初始化客户端
+            current_key = self.key_rotator.get_current_key()
             self.client = OpenAIServiceClient(
                 api_key=current_key.api_key,
                 base_url=current_key.base_url,
@@ -85,10 +85,10 @@ class MessagesHandler:
                 base_url=api_keys_config[0]["base_url"],
             )
         else:
-            # 多个 keys，使用轮换器（默认使用会话粘性策略）
-            instance.key_rotator = APIKeyRotator(api_keys_config, strategy="session_affinity")
-            # 使用轮换器选择的当前 key 初始化客户端（使用默认会话）
-            current_key = instance.key_rotator.get_current_key(session_id="default")
+            # 多个 keys，使用轮换器（使用轮询策略实现负载均衡）
+            instance.key_rotator = APIKeyRotator(api_keys_config, strategy="round_robin")
+            # 使用轮换器选择的当前 key 初始化客户端
+            current_key = instance.key_rotator.get_current_key()
             instance.client = OpenAIServiceClient(
                 api_key=current_key.api_key,
                 base_url=current_key.base_url,
@@ -118,7 +118,7 @@ class MessagesHandler:
             # 没有轮换器，直接抛出错误
             bound_logger.warning("未启用 API Key 轮换，直接返回错误")
             raise HTTPException(
-                status_code=error.error_response.status,
+                status_code=error.status_code or 500,
                 detail=error.error_response.model_dump(exclude_none=True),
             )
 
@@ -128,8 +128,9 @@ class MessagesHandler:
 
         self.key_rotator.handle_error(status_code, error_message)
 
-        # 检查是否切换了 key (使用 request_id 作为 session_id)
-        current_key = self.key_rotator.get_current_key(session_id=request_id or "default")
+        # 直接通过 current_key_index 获取切换后的 key
+        # 不使用 get_current_key() 因为它会走 session_affinity 逻辑导致选回旧 key
+        current_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
         self.client.update_credentials(current_key.api_key, current_key.base_url)
 
         # 尝试重新请求
@@ -160,69 +161,83 @@ class MessagesHandler:
         bound_logger = get_logger_with_request_id(request_id)
         last_error = None
 
-        # 获取当前请求的模型和回退列表
-        current_model = openai_request.model
-        config = await get_config()
-        fallback_models = config.models.fallback_models
+        while True:
+            config = await get_config()
+            fallback_models = config.models.fallback_models
 
-        # 构建模型尝试列表：当前模型 + 回退模型列表
-        models_to_try = [current_model] + [m for m in fallback_models if m != current_model]
+            # 检查当前 key 是否有模型覆盖（如本地 vLLM 固定模型）
+            current_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
+            if current_key.model:
+                models_to_try = [current_key.model]
+                openai_request.model = current_key.model
+            else:
+                current_model = openai_request.model
+                models_to_try = [current_model] + [m for m in fallback_models if m != current_model]
 
-        # 对每个模型进行尝试
-        for model_idx, model_to_try in enumerate(models_to_try):
-            # 更新请求模型
-            openai_request.model = model_to_try
+            key_switched_with_override = False
 
-            # 对当前模型进行多次重试
-            for attempt in range(max_retries):
-                try:
-                    # 如果不是原始模型，记录日志
-                    if model_idx > 0:
-                        bound_logger.info(
-                            f"尝试回退模型 {model_idx}/{len(models_to_try)}: {current_model} -> {model_to_try}"
+            for model_idx, model_to_try in enumerate(models_to_try):
+                openai_request.model = model_to_try
+
+                for attempt in range(max_retries):
+                    try:
+                        if model_idx > 0:
+                            bound_logger.info(
+                                f"尝试回退模型 {model_idx}/{len(models_to_try)}: {openai_request.model} -> {model_to_try}"
+                            )
+
+                        response = await self.client.send_request(
+                            openai_request, request_id=request_id
                         )
 
-                    response = await self.client.send_request(
-                        openai_request, request_id=request_id
-                    )
+                        if model_idx > 0:
+                            bound_logger.info(f"回退模型 {model_to_try} 成功响应")
 
-                    # 如果使用了回退模型，记录成功
-                    if model_idx > 0:
-                        bound_logger.info(
-                            f"回退模型 {model_to_try} 成功响应"
-                        )
+                        return response
 
-                    return response
+                    except OpenAIClientError as e:
+                        last_error = e
+                        is_permission_error = (e.status_code == 403)
+                        is_client_error = (400 <= e.status_code < 500) and e.status_code not in (403, 429)
 
-                except OpenAIClientError as e:
-                    last_error = e
-                    is_permission_error = (e.status_code == 403)
-
-                    bound_logger.warning(
-                        f"请求失败 (模型: {model_to_try}, 尝试 {attempt + 1}/{max_retries}) - Status: {e.status_code}"
-                    )
-
-                    # 如果是权限错误，不继续重试当前模型，直接尝试下一个模型
-                    if is_permission_error:
                         bound_logger.warning(
-                            f"检测到403权限错误，模型 {model_to_try} 无权限，尝试下一个模型"
+                            f"请求失败 (模型: {model_to_try}, 尝试 {attempt + 1}/{max_retries}) - Status: {e.status_code}"
                         )
-                        break  # 跳出当前模型的retry循环，进入下一个模型
 
-                    # 如果有轮换器且不是权限错误，尝试切换 key 并重试
-                    if self.key_rotator and attempt < max_retries - 1:
-                        await self._handle_client_error_with_retry(e, request_id=request_id or "default")
-                        # 继续当前模型的重试
-                        continue
-                    else:
-                        # 没有轮换器或已达最大重试次数，跳出当前模型循环
-                        break
+                        if is_permission_error:
+                            bound_logger.warning(
+                                f"检测到403权限错误，模型 {model_to_try} 无权限，尝试下一个模型"
+                            )
+                            break
 
-        # 所有模型和重试都失败
+                        if is_client_error:
+                            bound_logger.warning(f"客户端错误 {e.status_code}，不重试")
+                            break
+
+                        if self.key_rotator and attempt < max_retries - 1:
+                            await self._handle_client_error_with_retry(e, request_id=request_id or "default")
+                            new_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
+                            if new_key.model:
+                                openai_request.model = new_key.model
+                                bound_logger.info(
+                                    f"新 key [{new_key.name}] 有固定模型，切换至: {new_key.model}"
+                                )
+                                key_switched_with_override = True
+                                break
+                            continue
+                        else:
+                            break
+
+                if key_switched_with_override:
+                    break
+
+            if not key_switched_with_override:
+                break
+
         error_msg = f"所有模型尝试均失败: {', '.join(models_to_try)}"
         bound_logger.error(error_msg)
         raise HTTPException(
-            status_code=last_error.error_response.status if last_error else 500,
+            status_code=last_error.status_code if last_error else 500,
             detail=last_error.error_response.model_dump(exclude_none=True)
             if last_error
             else {"error": {"message": error_msg}},
@@ -340,6 +355,15 @@ class MessagesHandler:
             openai_request = await self.request_converter.convert_anthropic_to_openai(
                 request, request_id
             )
+
+            # 检查当前 key 是否有模型覆盖（如本地 vLLM 固定模型）
+            if self.key_rotator:
+                current_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
+                if current_key.model:
+                    openai_request.model = current_key.model
+                    bound_logger.info(
+                        f"流式请求应用 key [{current_key.name}] 的固定模型: {current_key.model}"
+                    )
 
             # 创建 OpenAI 流式数据源
             async def openai_stream_generator():

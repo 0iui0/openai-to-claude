@@ -16,17 +16,25 @@ def configure_logging(log_config) -> None:
     # 移除默认的handler
     logger.remove()
 
-    # 使用相对路径而不是绝对路径
-    log_path = Path("logs/app.log")
+    # 使用相对路径而不是绝对路径（支持 LOG_DIR 环境变量覆盖）
+    import os
+    log_dir = os.environ.get("LOG_DIR", "logs")
+    log_path = Path(log_dir) / "app.log"
 
     # 确保日志目录存在，并设置正确的权限
     log_path.parent.mkdir(parents=True, exist_ok=True)
     # 设置目录权限为755，确保当前用户可写
-    log_path.parent.chmod(0o755)
+    try:
+        log_path.parent.chmod(0o755)
+    except PermissionError:
+        pass
 
     # 如果日志文件已存在，确保其可写
     if log_path.exists():
-        log_path.chmod(0o644)
+        try:
+            log_path.chmod(0o644)
+        except PermissionError:
+            pass
 
     # 控制台日志格式（包含请求ID）
     console_format = "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{extra[request_id]}</cyan> | <cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
