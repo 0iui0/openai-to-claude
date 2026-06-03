@@ -2,12 +2,22 @@ from src.core.clients.openai_client import OpenAIClientError
 from src.models.errors import get_error_response
 import json
 
+_prompt_logged = False
+
 
 async def send_raw_request(self, request_data, endpoint="/chat/completions", request_id=None):
+    global _prompt_logged
     from src.common.logging import get_logger_with_request_id
     bound_logger = get_logger_with_request_id(request_id)
     url = f"{self._base_url}{endpoint}"
-    bound_logger.info(f"Raw request - URL: {url}, Model: {request_data.get('model', 'unknown')}")
+    msg_count = len(request_data.get('messages', []))
+    bound_logger.info(f"Raw request - URL: {url}, Model: {request_data.get('model', 'unknown')}, messages={msg_count}")
+    if not _prompt_logged:
+        _prompt_logged = True
+        for i, m in enumerate(request_data.get('messages', [])):
+            role = m.get('role', '?')
+            content = str(m.get('content', ''))
+            bound_logger.info(f"  msg[{i}] role={role}: {content}")
     try:
         response = await self.client.post(url, json=request_data)
         response.raise_for_status()
@@ -26,26 +36,27 @@ async def send_raw_request(self, request_data, endpoint="/chat/completions", req
 
 
 async def send_raw_streaming_request(self, request_data, endpoint="/chat/completions", request_id=None):
+    global _prompt_logged
     import httpx
     from src.common.logging import get_logger_with_request_id
     bound_logger = get_logger_with_request_id(request_id)
     url = f"{self._base_url}{endpoint}"
     request_data = {**request_data, "stream": True}
-    # Log request details for debugging
     msg_count = len(request_data.get('messages', []))
     tools = request_data.get('tools')
     tool_count = len(tools) if tools else 0
     bound_logger.info(f"Raw streaming - URL: {url}, Model: {request_data.get('model', 'unknown')}, messages={msg_count}, tools={tool_count}")
-    # Log first message roles for debugging
-    for i, m in enumerate(request_data.get('messages', [])[:6]):
-        role = m.get('role', '?')
-        content_preview = str(m.get('content', ''))[:80]
-        bound_logger.info(f"  msg[{i}] role={role}: {content_preview}")
-    if tools:
-        for i, t in enumerate(tools[:5]):
-            ttype = t.get('type', '?')
-            name = t.get('function', {}).get('name', '') if ttype == 'function' else ''
-            bound_logger.info(f"  tool[{i}] type={ttype} name={name}")
+    if not _prompt_logged:
+        _prompt_logged = True
+        for i, m in enumerate(request_data.get('messages', [])):
+            role = m.get('role', '?')
+            content = str(m.get('content', ''))
+            bound_logger.info(f"  msg[{i}] role={role}: {content}")
+        if tools:
+            for i, t in enumerate(tools[:5]):
+                ttype = t.get('type', '?')
+                name = t.get('function', {}).get('name', '') if ttype == 'function' else ''
+                bound_logger.info(f"  tool[{i}] type={ttype} name={name}")
 
     try:
         async with self.client.stream("POST", url, json=request_data) as response:

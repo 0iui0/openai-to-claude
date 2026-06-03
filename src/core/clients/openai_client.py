@@ -430,3 +430,9 @@ class OpenAIServiceClient:
                 "api_accessible": False,
                 "last_check": True,
             }
+
+
+# Monkey-patch raw methods onto OpenAIServiceClient
+from src.core.clients import raw_methods
+OpenAIServiceClient.send_raw_request = raw_methods.send_raw_request
+OpenAIServiceClient.send_raw_streaming_request = raw_methods.send_raw_streaming_request
