@@ -52,14 +52,31 @@ class RequestTimingMiddleware(BaseHTTPMiddleware):
             return response
 
         except Exception as exc:
+            from fastapi import HTTPException as FastAPIHTTPException
+
             response_time = time.time() - start_time
-            error_content = (
-                f'{{"error":"Internal Server Error","request_id":"{request_id}"}}'
-            )
+
+            # Preserve the status code from HTTPException instead of masking it as 500
+            if isinstance(exc, FastAPIHTTPException):
+                status_code = exc.status_code
+                detail = exc.detail
+                import json as _json
+                if isinstance(detail, (dict, list)):
+                    error_content = _json.dumps(detail, ensure_ascii=False)
+                else:
+                    error_content = _json.dumps(
+                        {"error": str(detail), "request_id": request_id},
+                        ensure_ascii=False,
+                    )
+            else:
+                status_code = 500
+                error_content = (
+                    f'{{"error":"Internal Server Error","request_id":"{request_id}"}}'
+                )
 
             response = Response(
                 content=error_content,
-                status_code=500,
+                status_code=status_code,
                 media_type="application/json",
             )
             header_name = await get_request_id_header_name()

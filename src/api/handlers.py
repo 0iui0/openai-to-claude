@@ -448,6 +448,80 @@ class MessagesHandler:
             yield f"event: error\ndata: {json.dumps(error_data, ensure_ascii=False)}\n\n"
 
 
+def _normalize_request_body(body: dict, bound_logger) -> dict:
+    """
+    预处理请求体，使其符合 Anthropic API 规范。
+
+    处理以下兼容性场景：
+    1. 从 messages 数组中提取 role="system" 的消息，合并到顶层 system 参数
+    2. (未来可扩展更多规范化逻辑)
+
+    Anthropic API 规范中 system 是顶层参数，不在 messages 数组中。
+    但某些客户端（如 Claude Code）可能以 OpenAI 格式发送 system 消息，
+    即将其放在 messages 数组里。此函数自动完成格式规范化。
+    """
+    messages = body.get("messages", [])
+    if not messages:
+        return body
+
+    # 分离 system 消息和普通消息
+    system_messages = []
+    normal_messages = []
+
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            system_messages.append(msg)
+        else:
+            normal_messages.append(msg)
+
+    if not system_messages:
+        return body
+
+    # 提取 system 消息的文本内容
+    system_texts = []
+    for msg in system_messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            system_texts.append(content)
+        elif isinstance(content, list):
+            # 处理 content 为列表的情况（如 [{"type": "text", "text": "..."}]）
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    system_texts.append(block.get("text", ""))
+
+    extracted_system = "\n".join(system_texts) if system_texts else None
+
+    # 合并到现有的 system 参数
+    existing_system = body.get("system")
+    if existing_system:
+        if isinstance(existing_system, str):
+            combined = f"{existing_system}\n{extracted_system}" if extracted_system else existing_system
+        elif isinstance(existing_system, list):
+            # system 是 AnthropicSystemMessage 列表格式
+            if extracted_system:
+                combined = list(existing_system) + [{"type": "text", "text": extracted_system}]
+            else:
+                combined = existing_system
+        else:
+            combined = extracted_system
+    else:
+        combined = extracted_system
+
+    # 更新 body
+    body = body.copy()
+    body["messages"] = normal_messages
+    if combined:
+        body["system"] = combined
+
+    if system_texts:
+        bound_logger.info(
+            f"从 messages 数组中提取了 {len(system_messages)} 条 system 消息，"
+            f"已合并到顶层 system 参数"
+        )
+
+    return body
+
+
 @router.post("/messages")
 async def messages_endpoint(request: Request, background_tasks: BackgroundTasks):
     """
@@ -479,6 +553,11 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
     try:
         # 解析请求体
         body = await request.json()
+
+        # 预处理：从 messages 数组中提取 system 角色的消息，
+        # 并将其合并到顶层的 system 参数中（符合 Anthropic API 规范）
+        body = _normalize_request_body(body, bound_logger)
+
         # 记录请求
         log_body = body.copy()
         log_body["tools"] = []
