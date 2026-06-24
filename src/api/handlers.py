@@ -12,7 +12,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 
-from src.core.api_key_rotator import APIKeyRotator
+from src.core.api_key_rotator import APIKeyInfo, APIKeyRotator
 from src.core.clients.openai_client import OpenAIClientError, OpenAIServiceClient
 from src.core.converters.request_converter import (
     AnthropicToOpenAIConverter,
@@ -36,27 +36,32 @@ class MessagesHandler:
         self.config = config
         self._config = None
 
-        # 初始化 API Key 轮换器
+        # 初始化 API Key 轮换器和客户端池
         api_keys_config = config.openai.get_effective_keys()
         if not api_keys_config:
             raise ValueError("未配置任何 API Key")
 
-        # 如果只有一个 key，不需要轮换器，直接使用
         if len(api_keys_config) == 1:
+            # 单 key：不需要轮换器，直接使用
             self.key_rotator = None
-            self.client = OpenAIServiceClient(
-                api_key=api_keys_config[0]["api_key"],
-                base_url=api_keys_config[0]["base_url"],
-            )
+            self._clients: dict[int, OpenAIServiceClient] = {
+                0: OpenAIServiceClient(
+                    api_key=api_keys_config[0]["api_key"],
+                    base_url=api_keys_config[0]["base_url"],
+                )
+            }
         else:
-            # 多个 keys，使用轮换器（使用轮询策略实现负载均衡）
+            # 多 keys：使用 round_robin 策略 + per-key 客户端池
+            # round_robin 在 asyncio.Lock 保护下循环分配 key，并发请求自动分散
+            # per-key 客户端池确保每个 key 有独立的 HTTP 连接，无 credential 冲突
             self.key_rotator = APIKeyRotator(api_keys_config, strategy="round_robin")
-            # 使用轮换器选择的当前 key 初始化客户端
-            current_key = self.key_rotator.get_current_key()
-            self.client = OpenAIServiceClient(
-                api_key=current_key.api_key,
-                base_url=current_key.base_url,
-            )
+            # 为每个 key 创建独立的 OpenAIServiceClient，避免并发时共享 client 的 credential 冲突
+            self._clients: dict[int, OpenAIServiceClient] = {}
+            for idx, key_config in enumerate(api_keys_config):
+                self._clients[idx] = OpenAIServiceClient(
+                    api_key=key_config["api_key"],
+                    base_url=key_config.get("base_url"),
+                )
 
     @classmethod
     async def create(cls, config=None):
@@ -72,40 +77,58 @@ class MessagesHandler:
         instance.config = config
         instance._config = config
 
-        # 初始化 API Key 轮换器
+        # 初始化 API Key 轮换器和客户端池
         api_keys_config = config.openai.get_effective_keys()
         if not api_keys_config:
             raise ValueError("未配置任何 API Key")
 
-        # 如果只有一个 key，不需要轮换器，直接使用
         if len(api_keys_config) == 1:
             instance.key_rotator = None
-            instance.client = OpenAIServiceClient(
-                api_key=api_keys_config[0]["api_key"],
-                base_url=api_keys_config[0]["base_url"],
-            )
+            instance._clients = {
+                0: OpenAIServiceClient(
+                    api_key=api_keys_config[0]["api_key"],
+                    base_url=api_keys_config[0]["base_url"],
+                )
+            }
         else:
-            # 多个 keys，使用轮换器（使用轮询策略实现负载均衡）
-            instance.key_rotator = APIKeyRotator(api_keys_config, strategy="round_robin")
-            # 使用轮换器选择的当前 key 初始化客户端
-            current_key = instance.key_rotator.get_current_key()
-            instance.client = OpenAIServiceClient(
-                api_key=current_key.api_key,
-                base_url=current_key.base_url,
-            )
+            instance.key_rotator = APIKeyRotator(api_keys_config, strategy="balanced")
+            instance._clients = {}
+            for idx, key_config in enumerate(api_keys_config):
+                instance._clients[idx] = OpenAIServiceClient(
+                    api_key=key_config["api_key"],
+                    base_url=key_config.get("base_url"),
+                )
 
         return instance
+
+    async def _get_client_for_session(self, session_id: str | None = None) -> tuple[OpenAIServiceClient, APIKeyInfo | None]:
+        """根据 session 获取对应的 client 和 key 信息（并发安全）
+
+        Args:
+            session_id: 会话标识符（用于 session_affinity 策略）
+
+        Returns:
+            (client, key_info) 元组。key_info 在无轮换器时为 None
+        """
+        if self.key_rotator is None:
+            return self._clients[0], None
+
+        key_info = await self.key_rotator.get_current_key(session_id=session_id)
+        client = self._clients[key_info.index]
+        return client, key_info
 
     async def _handle_client_error_with_retry(
         self,
         error: OpenAIClientError,
         request_id: str | None = None,
+        session_id: str | None = None,
     ):
         """处理客户端错误并根据需要切换 API key
 
         Args:
             error: OpenAI 客户端错误
-            request_id: 请求 ID (用作 session_id)
+            request_id: 请求 ID
+            session_id: 会话 ID（用于 session_affinity 策略的错误处理）
 
         Raises:
             HTTPException: 如果无法恢复或所有 keys 都不可用
@@ -122,24 +145,21 @@ class MessagesHandler:
                 detail=error.error_response.model_dump(exclude_none=True),
             )
 
-        # 使用轮换器处理错误
+        # 使用轮换器处理错误，传递 session_id 以便 session_affinity 策略正确处理
         status_code = error.status_code or 500
         error_message = error.error_message or str(error.error_response.error)
 
-        self.key_rotator.handle_error(status_code, error_message)
+        await self.key_rotator.handle_error(status_code, error_message, session_id=session_id)
 
-        # 直接通过 current_key_index 获取切换后的 key
-        # 不使用 get_current_key() 因为它会走 session_affinity 逻辑导致选回旧 key
-        current_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
-        self.client.update_credentials(current_key.api_key, current_key.base_url)
-
-        # 尝试重新请求
-        bound_logger.info(f"已切换到新的 API Key: {current_key.index}")
+        # 获取该 session 切换后的新 key 和对应的独立 client
+        new_key = await self.key_rotator.get_current_key(session_id=session_id)
+        bound_logger.info(f"已切换到新的 API Key [{new_key.name}] for session {session_id[:8] if session_id else 'global'}...")
 
     async def _send_request_with_retry(
         self,
         openai_request,
         request_id: str | None = None,
+        session_id: str | None = None,
         max_retries: int = 3,
     ):
         """发送请求并在配额用尽时自动重试，支持403权限错误的模型回退
@@ -147,6 +167,7 @@ class MessagesHandler:
         Args:
             openai_request: OpenAI 请求对象
             request_id: 请求 ID
+            session_id: 会话 ID（用于 session_affinity 策略）
             max_retries: 最大重试次数
 
         Returns:
@@ -161,13 +182,15 @@ class MessagesHandler:
         bound_logger = get_logger_with_request_id(request_id)
         last_error = None
 
+        # 获取当前 session 对应的 client 和 key
+        client, current_key = await self._get_client_for_session(session_id)
+
         while True:
             config = await get_config()
             fallback_models = config.models.fallback_models
 
             # 检查当前 key 是否有模型覆盖（如本地 vLLM 固定模型）
-            current_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
-            if current_key.model:
+            if current_key and current_key.model:
                 models_to_try = [current_key.model]
                 openai_request.model = current_key.model
             else:
@@ -186,7 +209,8 @@ class MessagesHandler:
                                 f"尝试回退模型 {model_idx}/{len(models_to_try)}: {openai_request.model} -> {model_to_try}"
                             )
 
-                        response = await self.client.send_request(
+                        # 使用 session 对应的独立 client 发送请求
+                        response = await client.send_request(
                             openai_request, request_id=request_id
                         )
 
@@ -215,12 +239,15 @@ class MessagesHandler:
                             break
 
                         if self.key_rotator and attempt < max_retries - 1:
-                            await self._handle_client_error_with_retry(e, request_id=request_id or "default")
-                            new_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
-                            if new_key.model:
-                                openai_request.model = new_key.model
+                            await self._handle_client_error_with_retry(
+                                e, request_id=request_id or "default", session_id=session_id
+                            )
+                            # 错误处理后重新获取 session 对应的 client 和 key
+                            client, current_key = await self._get_client_for_session(session_id)
+                            if current_key and current_key.model:
+                                openai_request.model = current_key.model
                                 bound_logger.info(
-                                    f"新 key [{new_key.name}] 有固定模型，切换至: {new_key.model}"
+                                    f"新 key [{current_key.name}] 有固定模型，切换至: {current_key.model}"
                                 )
                                 key_switched_with_override = True
                                 break
@@ -244,13 +271,16 @@ class MessagesHandler:
         )
 
     async def process_message(
-        self, request: AnthropicRequest, request_id: str = None
+        self, request: AnthropicRequest, request_id: str = None, session_id: str | None = None
     ) -> AnthropicMessageResponse:
         """处理非流式消息请求"""
         # 获取绑定了请求ID的logger
         from src.common.logging import get_logger_with_request_id
 
         bound_logger = get_logger_with_request_id(request_id)
+
+        # 获取当前 session 对应的 client 和 key
+        client, current_key = await self._get_client_for_session(session_id)
 
         try:
             bound_logger.debug("处理非流式请求")
@@ -261,9 +291,9 @@ class MessagesHandler:
                 request, request_id
             )
 
-            # 发送到 OpenAI（带重试机制）
+            # 发送到 OpenAI（带重试机制），传递 session_id
             openai_response = await self._send_request_with_retry(
-                openai_request, request_id=request_id
+                openai_request, request_id=request_id, session_id=session_id
             )
             bound_logger.debug(
                 f"OpenAI 响应: {json.dumps(openai_response, ensure_ascii=False)}"
@@ -286,13 +316,13 @@ class MessagesHandler:
                 f"Anthropic 响应生成完成 - Text: {response_text[:100]}..., Usage: {anthropic_response.usage}"
             )
 
-            # 标记 API key 使用成功，并统计 token 使用量
-            if self.key_rotator and anthropic_response.usage:
+            # 标记 API key 使用成功，并统计 token 使用量（使用 session 对应的 key）
+            if self.key_rotator and current_key and anthropic_response.usage:
                 total_tokens = (
                     (anthropic_response.usage.input_tokens or 0)
                     + (anthropic_response.usage.output_tokens or 0)
                 )
-                self.key_rotator.mark_key_success(tokens_used=total_tokens)
+                current_key.mark_success(tokens_used=total_tokens)
 
             return anthropic_response
 
@@ -338,7 +368,7 @@ class MessagesHandler:
             )
 
     async def process_stream_message(
-        self, request: AnthropicRequest, request_id: str = None
+        self, request: AnthropicRequest, request_id: str = None, session_id: str | None = None
     ) -> AsyncGenerator[str, None]:
         """处理流式消息请求，使用新的流式转换器"""
         if not request.stream:
@@ -350,6 +380,9 @@ class MessagesHandler:
         bound_logger = get_logger_with_request_id(request_id)
         total_tokens_used = 0  # 用于收集流式响应的 token 使用量
 
+        # 获取当前 session 对应的 client 和 key
+        stream_client, current_key = await self._get_client_for_session(session_id)
+
         try:
             # await validate_anthropic_request(request, request_id)
             openai_request = await self.request_converter.convert_anthropic_to_openai(
@@ -357,19 +390,17 @@ class MessagesHandler:
             )
 
             # 检查当前 key 是否有模型覆盖（如本地 vLLM 固定模型）
-            if self.key_rotator:
-                current_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
-                if current_key.model:
-                    openai_request.model = current_key.model
-                    bound_logger.info(
-                        f"流式请求应用 key [{current_key.name}] 的固定模型: {current_key.model}"
-                    )
+            if current_key and current_key.model:
+                openai_request.model = current_key.model
+                bound_logger.info(
+                    f"流式请求应用 key [{current_key.name}] 的固定模型: {current_key.model}"
+                )
 
-            # 创建 OpenAI 流式数据源
+            # 创建 OpenAI 流式数据源（使用 session 对应的独立 client）
             async def openai_stream_generator():
                 bound_logger.info("开始OpenAI流式生成")
                 chunk_count = 0
-                async for chunk in self.client.send_streaming_request(
+                async for chunk in stream_client.send_streaming_request(
                     openai_request, request_id=request_id
                 ):
                     # 跳过被解析器过滤掉的不完整chunk（通常是tool_calls片段）
@@ -407,9 +438,9 @@ class MessagesHandler:
                 yield anthropic_event
             bound_logger.info("流式转换完成")
 
-            # 标记 API key 使用成功，并统计 token 使用量
-            if self.key_rotator and total_tokens_used > 0:
-                self.key_rotator.mark_key_success(tokens_used=total_tokens_used)
+            # 标记 API key 使用成功，并统计 token 使用量（使用 session 对应的 key）
+            if current_key and total_tokens_used > 0:
+                current_key.mark_success(tokens_used=total_tokens_used)
 
         except (ValidationError, ValueError) as e:
             error_detail = e.errors() if hasattr(e, "errors") else str(e)
@@ -567,6 +598,10 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
 
         anthropic_request = AnthropicRequest(**body)
 
+        # 使用 request_id 作为 session_id，用于 key 轮转策略的并发分配
+        # balanced 策略会优先选择使用次数最少的 key，自动实现多 agent 并行负载均衡
+        session_id = request_id or client_ip
+
         # 记录清理后的请求信息（移除敏感信息）
         # safe_body = sanitize_for_logging(body)
         # logger.debug("请求已清理", request_body=safe_body)
@@ -578,7 +613,7 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
                 """包装器确保流式响应的立即传输"""
                 try:
                     async for chunk in handler.process_stream_message(
-                        anthropic_request, request_id=request_id
+                        anthropic_request, request_id=request_id, session_id=session_id
                     ):
                         # 立即传输每个chunk，不缓冲
                         # chunk已经是完整的SSE格式字符串，编码后返回
@@ -615,7 +650,7 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
         else:
             # 非流式响应
             response = await handler.process_message(
-                anthropic_request, request_id=request_id
+                anthropic_request, request_id=request_id, session_id=session_id
             )
             json_response = JSONResponse(content=response.model_dump(exclude_none=True))
             if request_id:

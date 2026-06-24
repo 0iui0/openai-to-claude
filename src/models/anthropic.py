@@ -2,7 +2,7 @@
 
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AnthropicStreamEventTypes:
@@ -54,12 +54,18 @@ class AnthropicRoles:
 
 
 class AnthropicMessageContent(BaseModel):
-    """Anthropic消息内容项"""
+    """Anthropic消息内容项
 
-    type: Literal["text", "thinking", "image", "tool_use", "tool_result"] = Field(
-        description="内容类型"
-    )
+    支持所有 Anthropic/Claude 内容块类型，包括 thinking、server_tool_use 等扩展格式。
+    使用 extra="allow" 确保向前兼容，未知字段自动通过。
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: str = Field(description="内容类型（text/thinking/image/tool_use/tool_result/server_tool_use等）")
     text: str | None = Field(None, description="文本内容（当type为text时）")
+    thinking: str | None = Field(None, description="思考内容（当type为thinking时）")
+    signature: str | None = Field(None, description="思考签名（当type为thinking时）")
     source: dict[str, Any] | None = Field(None, description="当type为image时的源信息")
     id: str | None = Field(None, description="工具调用ID（当type为tool_use时）")
     name: str | None = Field(None, description="工具名称（当type为tool_use时）")

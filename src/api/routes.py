@@ -108,8 +108,7 @@ async def reset_api_keys(request: Request) -> dict[str, Any]:
     handler.key_rotator.reset_all_keys()
 
     # 更新客户端凭证到重置后的当前key
-    current_key = handler.key_rotator.get_current_key()
-    handler.client.update_credentials(current_key.api_key, current_key.base_url)
+    current_key = await handler.key_rotator.get_current_key()
 
     return {
         "status": "ok",

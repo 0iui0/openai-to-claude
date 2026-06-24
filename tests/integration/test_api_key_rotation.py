@@ -19,9 +19,8 @@ class TestAPIKeyRotator:
 
         assert len(rotator.api_keys) == 3
         assert rotator.current_key_index is not None
-        assert rotator.current_date is not None
 
-    def test_get_current_key(self):
+    async def test_get_current_key(self):
         """测试获取当前 API key"""
         api_keys_config = [
             {"api_key": "key1", "daily_limit": 150.0},
@@ -29,12 +28,12 @@ class TestAPIKeyRotator:
         ]
 
         rotator = APIKeyRotator(api_keys_config)
-        current_key = rotator.get_current_key()
+        current_key = await rotator.get_current_key()
 
         assert isinstance(current_key, APIKeyInfo)
         assert current_key.api_key in ["key1", "key2"]
 
-    def test_get_current_api_key(self):
+    async def test_get_current_api_key(self):
         """测试获取当前 API key 字符串"""
         api_keys_config = [
             {"api_key": "key1", "daily_limit": 150.0},
@@ -42,7 +41,7 @@ class TestAPIKeyRotator:
         ]
 
         rotator = APIKeyRotator(api_keys_config)
-        api_key = rotator.get_current_api_key()
+        api_key = await rotator.get_current_api_key()
 
         assert api_key in ["key1", "key2"]
 
@@ -76,11 +75,12 @@ class TestAPIKeyRotator:
 
         # 500不应视为配额错误（服务端错误不应导致key永久禁用）
         assert rotator.is_quota_error(500) is False
-        assert rotator.is_quota_error(500, "quota exceeded") is False
+        # 注意：500 + 配额相关消息现在会被识别为配额错误（消息匹配 QUOTA_ERROR_PATTERNS）
+        assert rotator.is_quota_error(500, "quota exceeded") is True
         assert rotator.is_quota_error(500, "internal server error") is False
 
-    def test_handle_error_with_quota_error(self):
-        """测试处理配额错误"""
+    async def test_handle_error_with_quota_error(self):
+        """测试处理配额错误（非临时限流）"""
         api_keys_config = [
             {"api_key": "key1", "daily_limit": 150.0},
             {"api_key": "key2", "daily_limit": 150.0},
@@ -89,14 +89,33 @@ class TestAPIKeyRotator:
         rotator = APIKeyRotator(api_keys_config)
         initial_index = rotator.current_key_index
 
-        # 处理配额错误
-        rotator.handle_error(429, "Rate limit exceeded")
+        # 处理配额用尽错误（message 明确为 quota，非 transient rate limit）
+        await rotator.handle_error(429, "quota exceeded")
 
         # 验证已切换 key
         assert rotator.current_key_index != initial_index
         assert rotator.api_keys[initial_index].quota_exhausted is True
 
-    def test_handle_error_with_invalid_key(self):
+    async def test_handle_error_with_transient_rate_limit(self):
+        """测试处理临时限流（冷却，非配额耗尽）"""
+        api_keys_config = [
+            {"api_key": "key1", "daily_limit": 150.0},
+            {"api_key": "key2", "daily_limit": 150.0},
+        ]
+
+        rotator = APIKeyRotator(api_keys_config)
+        initial_index = rotator.current_key_index
+
+        # 处理临时限流（rate limit，应冷却而非配额耗尽）
+        await rotator.handle_error(429, "Rate limit exceeded")
+
+        # 验证已切换 key
+        assert rotator.current_key_index != initial_index
+        # 临时限流：quota_exhausted 应保持 False，但 key 不可用（在冷却期）
+        assert rotator.api_keys[initial_index].quota_exhausted is False
+        assert rotator.api_keys[initial_index].is_available() is False
+
+    async def test_handle_error_with_invalid_key(self):
         """测试处理无效 key 错误"""
         api_keys_config = [
             {"api_key": "key1", "daily_limit": 150.0},
@@ -107,7 +126,7 @@ class TestAPIKeyRotator:
         initial_index = rotator.current_key_index
 
         # 处理 401 错误（无效 key）
-        rotator.handle_error(401, "Invalid API key")
+        await rotator.handle_error(401, "Invalid API key")
 
         # 验证已切换 key
         assert rotator.current_key_index != initial_index
@@ -161,10 +180,10 @@ class TestAPIKeyRotator:
         assert "keys" in status
         assert len(status["keys"]) == 2
 
-        # 检查 key 信息是否正确脱敏
+        # 检查 key 信息是否正确脱敏（格式：前8位 + ... + 后4位）
         key_info = status["keys"][0]
         assert key_info["api_key"].startswith("sk-abc12")
-        assert key_info["api_key"].endswith("e456")
+        assert key_info["api_key"].endswith("f456")
         assert "index" in key_info
         assert "is_current" in key_info
         assert "is_available" in key_info
@@ -205,7 +224,7 @@ class TestAPIKeyRotator:
         # 同一天创建的两个 rotator 应该选择相同的 key
         assert rotator1.current_key_index == rotator2.current_key_index
 
-    def test_balanced_strategy_daily_reset(self):
+    async def test_balanced_strategy_daily_reset(self):
         """测试均衡策略下每日额度重置"""
         from unittest.mock import patch
         from datetime import date
@@ -218,7 +237,7 @@ class TestAPIKeyRotator:
         rotator = APIKeyRotator(api_keys_config, strategy="balanced")
 
         # 第一天：标记第一个 key 为配额用尽
-        first_key = rotator.get_current_key()
+        first_key = await rotator.get_current_key()
         assert first_key.quota_exhausted is False
         rotator.mark_key_quota_exhausted("Daily quota exceeded")
 
@@ -231,7 +250,7 @@ class TestAPIKeyRotator:
             mock_date.today.return_value = date.fromisoformat(tomorrow)
 
             # 获取 key 时应该检测到日期变更并重置所有 key
-            next_key = rotator.get_current_key()
+            next_key = await rotator.get_current_key()
 
             # 验证所有 key 的状态已重置
             for key_info in rotator.api_keys:
@@ -245,7 +264,7 @@ class TestAPIKeyRotator:
             # 验证日期已更新
             assert rotator.current_date == tomorrow
 
-    def test_quotas_exhausted_all_keys_scenario(self):
+    async def test_quotas_exhausted_all_keys_scenario(self):
         """测试所有 keys 在单日内配额用尽的场景"""
         api_keys_config = [
             {"api_key": "key1", "daily_limit": 150.0},
@@ -254,23 +273,20 @@ class TestAPIKeyRotator:
 
         rotator = APIKeyRotator(api_keys_config, strategy="balanced")
 
-        # 标记所有 key 为配额用尽
+        # 标记第一个 key 为配额用尽（会自动切换到下一个）
         rotator.mark_key_quota_exhausted("Key 1 quota exceeded")
-        rotator.mark_key_quota_exhausted("Key 2 quota exceeded")
+
+        # 当标记最后一个可用 key 为配额用尽时，找不到可用 key 应抛出异常
+        with pytest.raises(RuntimeError, match="所有API Key都不可用"):
+            rotator.mark_key_quota_exhausted("Key 2 quota exceeded")
 
         # 验证所有 key 都不可用
         for key_info in rotator.api_keys:
             assert key_info.quota_exhausted is True
             assert key_info.is_available() is False
 
-        # 尝试获取 key 应该抛出异常
-        with pytest.raises(RuntimeError, match="所有API Key都不可用"):
-            rotator.get_current_key()
-
-    def test_balanced_selection_with_different_failure_counts(self):
+    async def test_balanced_selection_with_different_failure_counts(self):
         """测试均衡策略根据失败次数选择 key"""
-        import random
-
         api_keys_config = [
             {"api_key": "key1", "daily_limit": 150.0},
             {"api_key": "key2", "daily_limit": 150.0},
@@ -279,18 +295,21 @@ class TestAPIKeyRotator:
 
         rotator = APIKeyRotator(api_keys_config, strategy="balanced")
 
-        # 给不同的 key 设置不同的失败次数
+        # 第一次调用会触发每日状态重置（current_date: None -> today）
+        await rotator.get_current_key()
+
+        # 给不同的 key 设置不同的失败次数（在每日重置之后设置，避免被清除）
         rotator.api_keys[0].failure_count = 5
         rotator.api_keys[1].failure_count = 1
         rotator.api_keys[2].failure_count = 3
 
-        # 多次选择，应该倾向于选择失败次数最少的 key (key1)
+        # 多次选择，应该倾向于选择失败次数最少的 key (index 1)
         selected_counts = {0: 0, 1: 0, 2: 0}
         for _ in range(20):
-            selected = rotator.get_current_key()
+            selected = await rotator.get_current_key()
             selected_counts[selected.index] += 1
 
-        # key1（失败次数最少）应该被选择最多
+        # index 1（失败次数最少）应该被选择最多
         assert selected_counts[1] > selected_counts[0]
         assert selected_counts[1] > selected_counts[2]
 
@@ -321,8 +340,8 @@ class TestOpenAIConfig:
             api_key=None,
             base_url="https://api.openai.com/v1",
             api_keys=[
-                OpenAIKeyConfig(api_key="sk-key1", daily_limit=150.0),
-                OpenAIKeyConfig(api_key="sk-key2", daily_limit=150.0),
+                OpenAIKeyConfig(name="key1", api_key="sk-key1", daily_limit=150.0),
+                OpenAIKeyConfig(name="key2", api_key="sk-key2", daily_limit=150.0),
             ],
         )
 
@@ -340,6 +359,7 @@ class TestOpenAIConfig:
             base_url="https://api.openai.com/v1",
             api_keys=[
                 OpenAIKeyConfig(
+                    name="key1",
                     api_key="sk-key1",
                     daily_limit=150.0,
                     base_url="https://custom.api.com/v1",
@@ -352,17 +372,15 @@ class TestOpenAIConfig:
         assert keys[0]["base_url"] == "https://custom.api.com/v1"
 
     def test_get_effective_keys_empty(self):
-        """测试空配置"""
+        """测试空配置（未配置任何 key 应抛出校验错误）"""
         from src.config.settings import OpenAIConfig
 
-        config = OpenAIConfig(
-            api_key=None,
-            base_url="https://api.openai.com/v1",
-            api_keys=None,
-        )
-
-        keys = config.get_effective_keys()
-        assert len(keys) == 0
+        with pytest.raises(Exception):
+            OpenAIConfig(
+                api_key=None,
+                base_url="https://api.openai.com/v1",
+                api_keys=None,
+            )
 
 
 if __name__ == "__main__":

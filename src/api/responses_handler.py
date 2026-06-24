@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from src.core.clients.openai_client import OpenAIClientError, OpenAIServiceClient
-from src.core.api_key_rotator import APIKeyRotator
+from src.core.api_key_rotator import APIKeyInfo, APIKeyRotator
 from src.models.openai import OpenAIMessage
 
 router = APIRouter(prefix="/v1", tags=["responses"])
@@ -284,17 +284,27 @@ class ResponsesHandler:
 
         if len(api_keys_config) == 1:
             self.key_rotator = None
-            self.client = OpenAIServiceClient(
-                api_key=api_keys_config[0]["api_key"],
-                base_url=api_keys_config[0]["base_url"],
-            )
+            self._clients: dict[int, OpenAIServiceClient] = {
+                0: OpenAIServiceClient(
+                    api_key=api_keys_config[0]["api_key"],
+                    base_url=api_keys_config[0]["base_url"],
+                )
+            }
         else:
             self.key_rotator = APIKeyRotator(api_keys_config, strategy="round_robin")
-            current_key = self.key_rotator.get_current_key()
-            self.client = OpenAIServiceClient(
-                api_key=current_key.api_key,
-                base_url=current_key.base_url,
-            )
+            self._clients: dict[int, OpenAIServiceClient] = {}
+            for idx, key_config in enumerate(api_keys_config):
+                self._clients[idx] = OpenAIServiceClient(
+                    api_key=key_config["api_key"],
+                    base_url=key_config.get("base_url"),
+                )
+
+    async def _get_client_for_session(self, session_id: str | None = None) -> tuple[OpenAIServiceClient, APIKeyInfo | None]:
+        """Get per-session client and key info (async-safe)"""
+        if self.key_rotator is None:
+            return self._clients[0], None
+        key_info = await self.key_rotator.get_current_key(session_id=session_id)
+        return self._clients[key_info.index], key_info
 
     @classmethod
     async def create(cls, config=None):
@@ -309,21 +319,22 @@ class ResponsesHandler:
         bound_logger = get_logger_with_request_id(request_id)
         last_error = None
 
+        client, current_key = await self._get_client_for_session(request_id)
+
         for attempt in range(max_retries):
             try:
-                response = await self.client.send_raw_request(chat_req, request_id=request_id)
-                if self.key_rotator:
+                response = await client.send_raw_request(chat_req, request_id=request_id)
+                if current_key:
                     usage = response.get("usage", {})
                     total = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                    self.key_rotator.mark_key_success(tokens_used=total)
+                    current_key.mark_success(tokens_used=total)
                 return response
             except OpenAIClientError as e:
                 last_error = e
                 bound_logger.warning(f"Request failed (attempt {attempt + 1}/{max_retries}): {e.status_code}")
                 if self.key_rotator and attempt < max_retries - 1:
-                    self.key_rotator.handle_error(e.status_code or 500, str(e))
-                    current_key = self.key_rotator.api_keys[self.key_rotator.current_key_index]
-                    self.client.update_credentials(current_key.api_key, current_key.base_url)
+                    await self.key_rotator.handle_error(e.status_code or 500, str(e), session_id=request_id)
+                    client, current_key = await self._get_client_for_session(request_id)
                 else:
                     break
 
@@ -358,6 +369,8 @@ class ResponsesHandler:
 
         bound_logger.info(f"Responses API streaming -> Chat Completions: model={chat_req.get('model')}")
 
+        client, current_key = await self._get_client_for_session(request_id)
+
         resp_id = f"resp_{uuid.uuid4().hex[:24]}"
         model = body.get("model", "gpt-4o")
         created_at = int(time.time())
@@ -385,7 +398,7 @@ class ResponsesHandler:
         yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': msg_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': []}})}\n\n"
         yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'output_index': msg_output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
 
-        async for chunk in self.client.send_raw_streaming_request(chat_req, request_id=request_id):
+        async for chunk in client.send_raw_streaming_request(chat_req, request_id=request_id):
             if chunk.startswith("data: "):
                 data_str = chunk[6:]
                 if data_str.strip() == "[DONE]":

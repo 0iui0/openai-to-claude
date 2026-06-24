@@ -1,5 +1,6 @@
 """API Key轮换器，支持多API key管理和智能切换"""
 
+import asyncio
 import hashlib
 import time
 from datetime import date
@@ -227,6 +228,9 @@ class APIKeyRotator:
         # 会话粘性：session_id -> key_index 的映射
         self.session_key_mapping: dict[str, int] = {}
 
+        # 并发安全锁：保护 session_key_mapping 和 current_key_index 的读写
+        self._lock = asyncio.Lock()
+
         # 初始化时选择今天的key
         self._initialize_key_selection()
 
@@ -359,8 +363,8 @@ class APIKeyRotator:
 
         return selected_key
 
-    def get_current_key(self, session_id: str | None = None) -> APIKeyInfo:
-        """获取当前使用的API key
+    async def get_current_key(self, session_id: str | None = None) -> APIKeyInfo:
+        """获取当前使用的API key（并发安全）
 
         Args:
             session_id: 会话标识符（用于会话粘性策略）
@@ -368,18 +372,19 @@ class APIKeyRotator:
         Returns:
             当前使用的API key信息
         """
-        if self.strategy == "session_affinity":
-            if session_id is None:
-                # 如果没有提供session_id，使用默认的"global"会话
-                session_id = "global"
-            return self._select_key_for_session(session_id)
-        elif self.strategy == "balanced":
-            return self._select_balanced_key()
-        elif self.strategy == "round_robin":
-            return self._select_round_robin_key()
-        else:  # daily
-            self._select_daily_key()
-            return self.api_keys[self.current_key_index]
+        async with self._lock:
+            if self.strategy == "session_affinity":
+                if session_id is None:
+                    # 如果没有提供session_id，使用默认的"global"会话
+                    session_id = "global"
+                return self._select_key_for_session(session_id)
+            elif self.strategy == "balanced":
+                return self._select_balanced_key()
+            elif self.strategy == "round_robin":
+                return self._select_round_robin_key()
+            else:  # daily
+                self._select_daily_key()
+                return self.api_keys[self.current_key_index]
 
     def _select_balanced_key(self) -> APIKeyInfo:
         """选择使用次数最少的可用key（均衡策略）
@@ -512,21 +517,21 @@ class APIKeyRotator:
         )
         raise RuntimeError("所有API Key都不可用，请检查配置或等待配额重置")
 
-    def get_current_api_key(self, session_id: str | None = None) -> str:
+    async def get_current_api_key(self, session_id: str | None = None) -> str:
         """获取当前使用的API key字符串
 
         Args:
             session_id: 会话标识符（用于会话粘性策略）
         """
-        return self.get_current_key(session_id).api_key
+        return (await self.get_current_key(session_id)).api_key
 
-    def get_current_base_url(self, session_id: str | None = None) -> str | None:
+    async def get_current_base_url(self, session_id: str | None = None) -> str | None:
         """获取当前使用的base URL
 
         Args:
             session_id: 会话标识符（用于会话粘性策略）
         """
-        return self.get_current_key(session_id).base_url
+        return (await self.get_current_key(session_id)).base_url
 
     def mark_key_failure(self, error_message: str | None = None, switch_key: bool = False):
         """标记当前key失败
@@ -713,62 +718,63 @@ class APIKeyRotator:
         error_lower = error_message.lower()
         return any(p in error_lower for p in self.TRANSIENT_RATE_LIMIT_PATTERNS)
 
-    def handle_error(self, status_code: int, error_message: str | None = None, session_id: str | None = None):
-        """处理API错误，自动判断是否需要切换key
+    async def handle_error(self, status_code: int, error_message: str | None = None, session_id: str | None = None):
+        """处理API错误，自动判断是否需要切换key（并发安全）
 
         Args:
             status_code: HTTP状态码
             error_message: 错误消息
             session_id: 触发错误的会话ID（用于自动分配新key到该会话）
         """
-        if self.is_quota_error(status_code, error_message):
-            logger.warning(
-                f"检测到配额用尽错误 - Status: {status_code}, Error: {error_message}"
-            )
-            self.mark_key_quota_exhausted(error_message, session_id=session_id)
-        elif status_code == 401:
-            # API key无效
-            logger.error(f"检测到无效的API Key - Status: {status_code}")
-            self.mark_key_quota_exhausted(f"Invalid API key: {error_message}", session_id=session_id)
-        elif self.is_transient_rate_limit(error_message):
-            # 临时限流（任何状态码）：冷却5分钟后自动恢复
-            logger.warning(
-                f"临时限流（冷却5分钟） - Status: {status_code}, Error: {error_message}"
-            )
-            current_key = self.api_keys[self.current_key_index]
-            current_key.mark_rate_limited(cooldown_seconds=300)
-            self._switch_to_next_available_key()
-        elif status_code == 500:
-            # 500服务端错误：检查错误消息判断是配额耗尽还是临时限流
-            if self.is_transient_rate_limit(error_message):
-                # 临时限流：冷却5分钟后自动恢复
+        async with self._lock:
+            if self.is_quota_error(status_code, error_message):
                 logger.warning(
-                    f"500临时限流（切换key，冷却5分钟） - Status: {status_code}, Error: {error_message}"
+                    f"检测到配额用尽错误 - Status: {status_code}, Error: {error_message}"
+                )
+                self.mark_key_quota_exhausted(error_message, session_id=session_id)
+            elif status_code == 401:
+                # API key无效
+                logger.error(f"检测到无效的API Key - Status: {status_code}")
+                self.mark_key_quota_exhausted(f"Invalid API key: {error_message}", session_id=session_id)
+            elif self.is_transient_rate_limit(error_message):
+                # 临时限流（任何状态码）：冷却5分钟后自动恢复
+                logger.warning(
+                    f"临时限流（冷却5分钟） - Status: {status_code}, Error: {error_message}"
                 )
                 current_key = self.api_keys[self.current_key_index]
                 current_key.mark_rate_limited(cooldown_seconds=300)
                 self._switch_to_next_available_key()
-            elif error_message and any(p in error_message.lower() for p in self.QUOTA_ERROR_PATTERNS):
-                # 500但消息包含配额关键词（如"额度已用完"）：标记为配额耗尽
+            elif status_code == 500:
+                # 500服务端错误：检查错误消息判断是配额耗尽还是临时限流
+                if self.is_transient_rate_limit(error_message):
+                    # 临时限流：冷却5分钟后自动恢复
+                    logger.warning(
+                        f"500临时限流（切换key，冷却5分钟） - Status: {status_code}, Error: {error_message}"
+                    )
+                    current_key = self.api_keys[self.current_key_index]
+                    current_key.mark_rate_limited(cooldown_seconds=300)
+                    self._switch_to_next_available_key()
+                elif error_message and any(p in error_message.lower() for p in self.QUOTA_ERROR_PATTERNS):
+                    # 500但消息包含配额关键词（如"额度已用完"）：标记为配额耗尽
+                    logger.warning(
+                        f"500配额耗尽错误 - Status: {status_code}, Error: {error_message}"
+                    )
+                    self.mark_key_quota_exhausted(error_message, session_id=session_id)
+                else:
+                    # 其他500错误：仅标记失败，切换key重试
+                    logger.warning(
+                        f"500服务端错误（切换key重试） - Status: {status_code}, Error: {error_message}"
+                    )
+                    self.mark_key_failure(error_message, switch_key=True)
+            elif status_code in (502, 503, 504):
+                # 上游网关错误：所有key共用同一个base_url，换key无意义，仅记录
                 logger.warning(
-                    f"500配额耗尽错误 - Status: {status_code}, Error: {error_message}"
+                    f"上游网关错误（不换key，直接重试） - Status: {status_code}, Error: {error_message}"
                 )
-                self.mark_key_quota_exhausted(error_message, session_id=session_id)
+                self.mark_key_failure(error_message)
             else:
-                # 其他500错误：仅标记失败，切换key重试
-                logger.warning(
-                    f"500服务端错误（切换key重试） - Status: {status_code}, Error: {error_message}"
-                )
-                self.mark_key_failure(error_message, switch_key=True)
-        elif status_code in (502, 503, 504):
-            # 上游网关错误：所有key共用同一个base_url，换key无意义，仅记录
-            logger.warning(
-                f"上游网关错误（不换key，直接重试） - Status: {status_code}, Error: {error_message}"
-            )
-            self.mark_key_failure(error_message)
-        else:
-            # 其他错误，仅记录不切换
-            self.mark_key_failure(error_message)
+                # 其他错误，仅记录不切换
+                self.mark_key_failure(error_message)
 
     def get_status(self) -> dict[str, Any]:
         """获取所有key的状态信息和使用统计"""
