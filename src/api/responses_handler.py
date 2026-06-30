@@ -9,6 +9,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
@@ -398,57 +399,62 @@ class ResponsesHandler:
         yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': msg_output_index, 'item': {'type': 'message', 'id': msg_id, 'role': 'assistant', 'content': []}})}\n\n"
         yield f"event: response.content_part.added\ndata: {json.dumps({'type': 'response.content_part.added', 'output_index': msg_output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': ''}})}\n\n"
 
-        async for chunk in client.send_raw_streaming_request(chat_req, request_id=request_id):
-            if chunk.startswith("data: "):
-                data_str = chunk[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                    if data.get("usage"):
-                        u = data["usage"]
-                        input_tokens = u.get("prompt_tokens", input_tokens)
-                        output_tokens = u.get("completion_tokens", output_tokens)
+        # aclosing 确保上游异步生成器被有序关闭，避免依赖 asyncio 的 asyncgen
+        # finalizer 触发 "aclose(): asynchronous generator is already running" 竞态
+        async with aclosing(
+            client.send_raw_streaming_request(chat_req, request_id=request_id)
+        ) as raw_stream:
+            async for chunk in raw_stream:
+                if chunk.startswith("data: "):
+                    data_str = chunk[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        if data.get("usage"):
+                            u = data["usage"]
+                            input_tokens = u.get("prompt_tokens", input_tokens)
+                            output_tokens = u.get("completion_tokens", output_tokens)
 
-                    for choice in data.get("choices", []):
-                        delta = choice.get("delta", {})
+                        for choice in data.get("choices", []):
+                            delta = choice.get("delta", {})
 
-                        # Text deltas
-                        text = delta.get("content")
-                        if text:
-                            full_text += text
-                            yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'output_index': msg_output_index, 'content_index': content_index, 'delta': text})}\n\n"
+                            # Text deltas
+                            text = delta.get("content")
+                            if text:
+                                full_text += text
+                                yield f"event: response.output_text.delta\ndata: {json.dumps({'type': 'response.output_text.delta', 'output_index': msg_output_index, 'content_index': content_index, 'delta': text})}\n\n"
 
-                        # Tool call deltas
-                        tc_deltas = delta.get("tool_calls", [])
-                        for tc in tc_deltas:
-                            tc_index = tc.get("index", 0)
-                            fn_delta = tc.get("function", {})
-                            tc_id = tc.get("id", "")
+                            # Tool call deltas
+                            tc_deltas = delta.get("tool_calls", [])
+                            for tc in tc_deltas:
+                                tc_index = tc.get("index", 0)
+                                fn_delta = tc.get("function", {})
+                                tc_id = tc.get("id", "")
 
-                            # New tool call (has id and name)
-                            if tc_id and fn_delta.get("name"):
-                                tool_output_index = next_output_index
-                                next_output_index += 1
-                                initial_args = fn_delta.get("arguments", "")
-                                tool_calls_acc[tc_index] = {
-                                    "id": tc_id,
-                                    "name": fn_delta["name"],
-                                    "arguments": initial_args,
-                                    "output_index": tool_output_index,
-                                }
-                                # Emit output_item.added for function_call
-                                yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': tool_output_index, 'item': {'type': 'function_call', 'id': tc_id, 'call_id': tc_id, 'name': fn_delta['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
-                                if initial_args:
-                                    yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': tool_output_index, 'item_id': tc_id, 'call_id': tc_id, 'delta': initial_args})}\n\n"
-                                bound_logger.debug(f"Tool call started: {fn_delta['name']} at output_index={tool_output_index}")
-                            # Continuing tool call (arguments only)
-                            elif tc_index in tool_calls_acc and fn_delta.get("arguments"):
-                                acc = tool_calls_acc[tc_index]
-                                acc["arguments"] += fn_delta["arguments"]
-                                yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': acc['output_index'], 'item_id': acc['id'], 'call_id': acc['id'], 'delta': fn_delta['arguments']})}\n\n"
-                except json.JSONDecodeError:
-                    pass
+                                # New tool call (has id and name)
+                                if tc_id and fn_delta.get("name"):
+                                    tool_output_index = next_output_index
+                                    next_output_index += 1
+                                    initial_args = fn_delta.get("arguments", "")
+                                    tool_calls_acc[tc_index] = {
+                                        "id": tc_id,
+                                        "name": fn_delta["name"],
+                                        "arguments": initial_args,
+                                        "output_index": tool_output_index,
+                                    }
+                                    # Emit output_item.added for function_call
+                                    yield f"event: response.output_item.added\ndata: {json.dumps({'type': 'response.output_item.added', 'output_index': tool_output_index, 'item': {'type': 'function_call', 'id': tc_id, 'call_id': tc_id, 'name': fn_delta['name'], 'arguments': '', 'status': 'in_progress'}})}\n\n"
+                                    if initial_args:
+                                        yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': tool_output_index, 'item_id': tc_id, 'call_id': tc_id, 'delta': initial_args})}\n\n"
+                                    bound_logger.debug(f"Tool call started: {fn_delta['name']} at output_index={tool_output_index}")
+                                # Continuing tool call (arguments only)
+                                elif tc_index in tool_calls_acc and fn_delta.get("arguments"):
+                                    acc = tool_calls_acc[tc_index]
+                                    acc["arguments"] += fn_delta["arguments"]
+                                    yield f"event: response.function_call_arguments.delta\ndata: {json.dumps({'type': 'response.function_call_arguments.delta', 'output_index': acc['output_index'], 'item_id': acc['id'], 'call_id': acc['id'], 'delta': fn_delta['arguments']})}\n\n"
+                    except json.JSONDecodeError:
+                        pass
 
         # Finalize text content part
         yield f"event: response.content_part.done\ndata: {json.dumps({'type': 'response.content_part.done', 'output_index': msg_output_index, 'content_index': content_index, 'part': {'type': 'output_text', 'text': full_text}})}\n\n"
@@ -496,9 +502,14 @@ async def responses_endpoint(request: Request, background_tasks: BackgroundTasks
         if body.get("stream"):
             async def stream_wrapper():
                 try:
-                    async for chunk in handler.process_stream_request(body, request_id=request_id):
-                        yield chunk.encode("utf-8")
-                        await asyncio.sleep(0)
+                    # aclosing 确保客户端断开或正常结束时整条生成器链被有序关闭，
+                    # 避免依赖 asyncgen finalizer 触发 aclose 竞态
+                    async with aclosing(
+                        handler.process_stream_request(body, request_id=request_id)
+                    ) as stream:
+                        async for chunk in stream:
+                            yield chunk.encode("utf-8")
+                            await asyncio.sleep(0)
                 except Exception as e:
                     bound_logger.exception(f"Stream error: {e}")
                     error_event = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"

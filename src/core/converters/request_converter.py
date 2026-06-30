@@ -258,13 +258,33 @@ class AnthropicToOpenAIConverter:
             anthropic_request.system
         )
 
-        # 转换工具定义
-        tools = AnthropicToOpenAIConverter._convert_tools(anthropic_request.tools)
-
         # 获取配置中的参数覆盖设置（异步获取）
         from src.config.settings import get_config
 
         config = await get_config()
+
+        # 可选：将 system prompt 注入到 messages 开头（作为 role=system 消息）。
+        # llama.cpp / llama-server 等后端不识别请求顶层的 `system` 字段，只认 messages
+        # 数组里的 system 消息。开启 inject_system_to_messages 后，system 会同时存在于
+        # 顶层字段（兼容支持它的后端）和 messages 开头（兼容不支持的后端）。
+        if system_prompt and getattr(config, "inject_system_to_messages", False):
+            from src.models.openai import OpenAIMessage as _OpenAIMessage
+
+            messages = [
+                _OpenAIMessage(role="system", content=system_prompt),
+                *messages,
+            ]
+            bound_logger.info(
+                "已将 system prompt 注入 messages 开头 (inject_system_to_messages=True)"
+            )
+
+        # 可选：精简上下文 —— 移除 <system-reminder> 噪音、截断 tool result、限制消息轮数
+        if getattr(config, "minimize_context", False):
+            messages = AnthropicToOpenAIConverter._minimize_messages(messages, bound_logger)
+
+        # 转换工具定义
+        tools = AnthropicToOpenAIConverter._convert_tools(anthropic_request.tools)
+
         overrides = config.parameter_overrides
 
         # 应用参数覆盖逻辑（配置覆盖客户端请求参数）
@@ -338,6 +358,56 @@ class AnthropicToOpenAIConverter:
             f"OpenAI 请求体: {log_openai_request.model_dump_json(exclude_none=True)}"
         )
         return openai_request
+
+    @staticmethod
+    def _minimize_messages(messages: list, bound_logger) -> list:
+        """精简上下文：删除冗余内容，帮助 12B 级别模型更稳定地处理长上下文。
+
+        策略：
+        1. 从所有消息的文本内容中移除 <system-reminder>...</system-reminder> 块
+        2. 保留第一条 system 消息 + 最近 N 条消息
+        3. 截断过长的 tool result 消息
+
+        Args:
+            messages: OpenAI 格式消息列表
+            bound_logger: 日志器
+
+        Returns:
+            精简后的消息列表
+        """
+        MAX_MESSAGES = 8
+        MAX_TOOL_RESULT_CHARS = 2000
+
+        result = []
+
+        # 第一步：从所有消息中移除 <system-reminder> 噪音
+        reminder_pattern = re.compile(r'<system-reminder>.*?</system-reminder>', re.DOTALL)
+
+        for msg in messages:
+            if isinstance(msg.content, str):
+                cleaned = reminder_pattern.sub('', msg.content).strip()
+                if not cleaned and msg.role == "tool":
+                    continue
+                msg.content = cleaned
+            result.append(msg)
+
+        # 第二步：截断过长的 tool result
+        for msg in result:
+            if msg.role == "tool" and isinstance(msg.content, str) and len(msg.content) > MAX_TOOL_RESULT_CHARS:
+                msg.content = msg.content[:MAX_TOOL_RESULT_CHARS] + "\n...(truncated by proxy)"
+                bound_logger.debug(f"截断 tool result 到 {MAX_TOOL_RESULT_CHARS} 字符")
+
+        # 第三步：限制消息数量，保留开头 system + 最近若干条
+        if len(result) > MAX_MESSAGES:
+            first = result[:1]
+            last = result[-(MAX_MESSAGES - 1):]
+            result = first + last
+            bound_logger.info(
+                f"精简上下文: {len(messages)} 条 → {len(result)} 条 "
+                f"(移除 {len(messages) - len(result)} 条旧消息)"
+            )
+
+        return result
 
     @staticmethod
     def _convert_messages(

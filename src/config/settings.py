@@ -214,6 +214,21 @@ class ModelConfig(BaseModel):
             "qwen3.6-plus",
         ],
     )
+    context_windows: dict[str, int] = Field(
+        default={
+            "glm-5.2": 1048576,
+            "glm-5.1": 1048576,
+            "glm-5": 200000,
+            "kimi-k2.5": 131072,
+            "qwen3.6-plus": 131072,
+            "gemini-2.5-pro": 1048576,
+            "gemini-2.5-flash": 1048576,
+            "deepseek-ai/DeepSeek-V3-0324": 131072,
+            "deepseek-ai/DeepSeek-R1-0528": 131072,
+            "Qwen/Qwen3-Coder": 131072,
+        },
+        description="模型上下文窗口大小（tokens）映射（按名前缀匹配），跳过输入超限的模型",
+    )
 
 
 class ParameterOverridesConfig(BaseModel):
@@ -258,6 +273,22 @@ class Config(BaseModel):
     logging: LoggingConfig = LoggingConfig()
     models: ModelConfig = ModelConfig()
     parameter_overrides: ParameterOverridesConfig = ParameterOverridesConfig()
+    # 是否将 system prompt 注入到 messages 数组开头（作为 role=system 消息）。
+    # 某些 OpenAI 兼容后端（如 llama.cpp / llama-server）不识别请求顶层的 `system` 字段，
+    # 只识别 messages 数组里的 system 消息。开启此项可确保这类后端也能收到 system prompt。
+    # 默认关闭以兼容已有的云端后端。本地 llama.cpp 后端建议开启。
+    inject_system_to_messages: bool = Field(
+        default=False,
+        description="将 system prompt 注入 messages 开头（role=system），兼容不认顶层 system 字段的后端",
+    )
+    # 是否精简上下文（删除 system-reminder 等噪音、截断过长 tool result、限制消息轮数）。
+    # 主要针对本地 12B 级别的模型，它们在海量上下文（20+ 条消息）下容易不稳定。
+    # 开启后会在转换阶段移除对模型无帮助的冗余内容，让模型聚焦于核心任务。
+    # 对 glm 等云端大模型不需要开启，它们可以处理完整上下文。
+    minimize_context: bool = Field(
+        default=False,
+        description="精简上下文：移除 <system-reminder>、保留最近 N 条消息、截断 tool result",
+    )
 
     @classmethod
     async def from_file(cls, config_path: str | None = None) -> "Config":

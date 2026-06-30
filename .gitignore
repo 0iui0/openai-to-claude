@@ -191,6 +191,7 @@ example
 config/settings.json
 config/settings.json.backup
 config/settings.json.new
+config/settings-jetson.json
 
 # Docker compose with local configuration
 docker-compose.yml

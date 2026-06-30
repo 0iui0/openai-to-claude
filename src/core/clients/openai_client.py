@@ -102,6 +102,7 @@ class OpenAIServiceClient:
         request: OpenAIRequest,
         endpoint: str = "/chat/completions",
         request_id: str = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Send synchronous request to OpenAI API.
 
@@ -109,6 +110,7 @@ class OpenAIServiceClient:
             request: OpenAI request object
             endpoint: API endpoint path
             request_id: 请求ID用于日志追踪
+            timeout: 请求超时时间(秒)，None则使用client默认值
 
         Returns:
             OpenAI API响应
@@ -133,6 +135,7 @@ class OpenAIServiceClient:
             response = await self.client.post(
                 url,
                 json=request_data,
+                timeout=timeout,
             )
             response.raise_for_status()
             # 记录响应状态
@@ -224,6 +227,7 @@ class OpenAIServiceClient:
         request: OpenAIRequest,
         endpoint: str = "/chat/completions",
         request_id: str = None,
+        timeout: float | None = None,
     ) -> AsyncGenerator[str, None]:
         """Send streaming request to OpenAI API.
 
@@ -231,6 +235,7 @@ class OpenAIServiceClient:
             request: OpenAI request object
             endpoint: API endpoint path
             request_id: 请求ID用于日志追踪
+            timeout: 请求超时时间(秒)，None则使用client默认值
 
         Yields:
             原始的Server-Sent Events数据行
@@ -290,8 +295,34 @@ class OpenAIServiceClient:
                 "POST",
                 url,
                 json=request_dict,
+                timeout=timeout,
             ) as response:
-                response.raise_for_status()
+                # 在stream上下文内显式检查状态码，这样aread()不会因
+                # raise_for_status()触发__aexit__而读到已关闭的流
+                if response.status_code >= 400:
+                    error_body = ""
+                    try:
+                        body_bytes = await response.aread()
+                        error_body = body_bytes.decode("utf-8", errors="ignore")
+                    except Exception:
+                        error_body = f"HTTP {response.status_code}"
+
+                    error_summary = (
+                        error_body[:500] + "..." if len(error_body) > 500 else error_body
+                    )
+                    bound_logger.error(
+                        f"OpenAI API 错误 - Status: {response.status_code}, URL: {url}"
+                    )
+                    bound_logger.error(f"Error Response: {error_summary}")
+                    raise OpenAIClientError(
+                        get_error_response(
+                            status_code=response.status_code,
+                            message=error_body,
+                            details={"type": "http_error"},
+                        ),
+                        response.status_code,
+                        error_body,
+                    )
 
                 # 记录流式响应开始
                 content_type = response.headers.get("content-type", "unknown")
@@ -323,15 +354,15 @@ class OpenAIServiceClient:
                     yield buffer.strip()
 
         except httpx.HTTPStatusError as e:
+            # 安全网：如果上面的显式检查没捕获到（极端情况），
+            # 尝试读取错误体但容忍流已关闭的情况
             error_body = ""
             try:
-                # 尝试读取完整的错误响应体
                 error_body = await e.response.aread()
                 error_body = error_body.decode("utf-8", errors="ignore")
-            except Exception as read_error:
-                error_body = f"无法读取错误响应: {str(read_error)}"
+            except Exception:
+                error_body = f"HTTP {e.response.status_code} error (stream already closed)"
 
-            # 记录完整错误信息，但在日志中截断过长内容
             error_summary = (
                 error_body[:500] + "..." if len(error_body) > 500 else error_body
             )
@@ -372,6 +403,10 @@ class OpenAIServiceClient:
                 502,
                 str(e),
             )
+
+        except GeneratorExit:
+            # 客户端断开连接或上层generator被aclose()，正常退出
+            return
 
     async def _parse_streaming_chunk(
         self, chunk_data: str, tool_calls_state: dict

@@ -1,4 +1,5 @@
 import json
+import re
 import time
 import traceback
 from collections.abc import AsyncIterator
@@ -46,6 +47,17 @@ from src.models.openai import (
     OpenAIChoice,
     OpenAIMessage,
 )
+
+# Gemma 等本地模型可能在文本开头输出 <channel|> 等伪影前缀
+_MODEL_ARTIFACT_PREFIX = re.compile(r'^<channel[^>]*>\s*')
+
+
+def _clean_model_output(text: str) -> str:
+    """清理模型输出中的已知伪影"""
+    if not text:
+        return text
+    text = _MODEL_ARTIFACT_PREFIX.sub('', text)
+    return text.strip()
 
 
 class StreamState:
@@ -697,7 +709,7 @@ def _build_complete_anthropic_response(
                             text_content += content
 
         if text_content.strip():
-            content_blocks.append({"type": "text", "text": text_content.strip()})
+            content_blocks.append({"type": "text", "text": _clean_model_output(text_content)})
 
     # 3. 处理工具调用
     if state.tool_calls:

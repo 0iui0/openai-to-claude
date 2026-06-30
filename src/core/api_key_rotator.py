@@ -55,6 +55,7 @@ class APIKeyInfo:
         self.last_error: str | None = None
         self.last_used_date: str | None = None
         self.rate_limited_until: float = 0
+        self.consecutive_quota_errors: int = 0  # 连续配额错误计数，用于区分真假配额耗尽
 
     def mark_failure(self, error: str | None = None):
         """标记key失败"""
@@ -74,6 +75,7 @@ class APIKeyInfo:
         """
         self.failure_count = 0
         self.last_error = None
+        self.consecutive_quota_errors = 0  # 成功后重置配额错误计数
         self.usage_count += 1
         self.daily_tokens_used += tokens_used
         if self.first_used_at is None:
@@ -140,6 +142,7 @@ class APIKeyInfo:
         self.rate_limited_until = 0
         self.estimated_cost = 0.0
         self.first_used_at = None
+        self.consecutive_quota_errors = 0
         tokens_before_reset = self.daily_tokens_used
         self.daily_tokens_used = 0
         logger.debug(
@@ -160,16 +163,20 @@ class APIKeyRotator:
     """
 
     # 配额用尽的错误特征
-    QUOTA_ERROR_CODES = [402, 429]
+    # 注意：429 不应在此列表中，因为 429 大多数情况下是临时限流（如 RPM/TPM 限制），
+    # 而非永久配额耗尽。只有明确包含配额关键词（如 "quota exceeded"）的 429 才算配额耗尽。
+    QUOTA_ERROR_CODES = [402]
     QUOTA_ERROR_PATTERNS = [
-        "quota",
-        "exceeded",
+        "quota exceeded",
+        "quota limit",
+        "insufficient quota",
         "insufficient",
         "balance",
         "credit",
         "额度",
         "用完",
         "限额",
+        "quota",
     ]
     # 临时限流特征（不应永久标记为耗尽）
     TRANSIENT_RATE_LIMIT_PATTERNS = [
@@ -285,8 +292,9 @@ class APIKeyRotator:
         available_keys = [k for k in self.api_keys if k.is_available()]
 
         if not available_keys:
-            logger.error("所有API Key都不可用！")
-            raise RuntimeError("所有API Key都不可用，请检查配置或等待配额重置")
+            self._ensure_at_least_one_key_available()
+            # 安全网恢复后重新选择
+            return self._select_key_by_weight()
 
         # 按权重随机选择
         import random
@@ -386,6 +394,66 @@ class APIKeyRotator:
                 self._select_daily_key()
                 return self.api_keys[self.current_key_index]
 
+    def _ensure_at_least_one_key_available(self):
+        """安全网：当所有key都不可用时，自动清除永久耗尽标记以尝试恢复
+
+        设计原理：
+        - 当ALL key都被标记为不可用时，极可能是错误分类（如上游短暂故障被误判为配额耗尽）
+        - 此时清除permanent的quota_exhausted标记，让key有机会重试
+        - 但保留临时rate_limited冷却（那是真实的限流反馈，应该遵守）
+
+        Returns:
+            True 如果恢复后至少有一个key可用，False 如果所有key确实被限流中
+
+        Raises:
+            RuntimeError: 如果所有key都是临时限流状态（无法立即恢复）
+        """
+        # 重新检查：是否有rate_limited已过期的key
+        now = time.time()
+        for key in self.api_keys:
+            if key.rate_limited_until and now >= key.rate_limited_until:
+                key.rate_limited_until = 0
+                logger.debug(f"API Key [{key.name}] 限流冷却已过期，自动恢复")
+
+        available = [k for k in self.api_keys if k.is_available()]
+        if available:
+            return True
+
+        # 检查是否所有不可用key都是因为临时限流（非quota_exhausted）
+        quota_exhausted_keys = [k for k in self.api_keys if k.quota_exhausted]
+        if not quota_exhausted_keys:
+            # 全部是临时限流，无法立即恢复
+            max_cooldown = max(
+                (k.rate_limited_until - now for k in self.api_keys if k.rate_limited_until),
+                default=0,
+            )
+            raise RuntimeError(
+                f"所有API Key都被临时限流，预计 {max_cooldown:.0f}s 后自动恢复"
+            )
+
+        # 有key被标记为永久耗尽 → 很可能是误判，清除所有配额耗尽标记
+        logger.warning(
+            f"所有 {len(self.api_keys)} 个API Key都不可用！"
+            f"其中 {len(quota_exhausted_keys)} 个被标记为配额耗尽。"
+            f"自动清除永久耗尽标记以尝试恢复..."
+        )
+        for key in self.api_keys:
+            if key.quota_exhausted:
+                logger.warning(
+                    f"重置 Key [{key.name}] - 原错误: {key.last_error}"
+                )
+                key.quota_exhausted = False
+                key.failure_count = 0
+                key.last_error = None
+
+        # 再次检查
+        available = [k for k in self.api_keys if k.is_available()]
+        if available:
+            logger.warning(f"安全网恢复成功，{len(available)} 个Key已恢复可用")
+            return True
+
+        raise RuntimeError("所有API Key都不可用，请检查配置或等待配额重置")
+
     def _select_balanced_key(self) -> APIKeyInfo:
         """选择使用次数最少的可用key（均衡策略）
 
@@ -432,8 +500,9 @@ class APIKeyRotator:
                     best_key = key_info
 
         if not available_keys:
-            logger.error("所有API Key都不可用！")
-            raise RuntimeError("所有API Key都不可用，请检查配置或等待配额重置")
+            self._ensure_at_least_one_key_available()
+            # 安全网恢复后重新选择
+            return self._select_balanced_key()
 
         # 如果有多个最优 key，随机选择一个
         if best_key is None:
@@ -511,11 +580,9 @@ class APIKeyRotator:
             checked_count += 1
 
         # 如果遍历完所有 key 都没有可用的
-        logger.error(
-            f"所有API Key都不可用！已检查 {checked_count} 个key，"
-            f"可用: 0/{total_keys}"
-        )
-        raise RuntimeError("所有API Key都不可用，请检查配置或等待配额重置")
+        self._ensure_at_least_one_key_available()
+        # 安全网恢复后重新选择
+        return self._select_round_robin_key()
 
     async def get_current_api_key(self, session_id: str | None = None) -> str:
         """获取当前使用的API key字符串
@@ -646,6 +713,8 @@ class APIKeyRotator:
             RuntimeError: 如果所有 key 都不可用
         """
         total_keys = len(self.api_keys)
+        if self.current_key_index is None:
+            self.current_key_index = 0
         original_key_index = self.current_key_index
         original_key_name = self.api_keys[original_key_index].name
 
@@ -670,12 +739,10 @@ class APIKeyRotator:
             index = (index + 1) % total_keys
             checked_count += 1
 
-        # 如果所有 key 都不可用
-        logger.error(
-            f"切换 API Key 失败 - 从 [{original_key_name}] 无法找到可用 key，"
-            f"已检查所有 {total_keys} 个 key"
-        )
-        raise RuntimeError("所有API Key都不可用，请检查配置或等待配额重置")
+        # 如果所有 key 都不可用，尝试安全网恢复
+        self._ensure_at_least_one_key_available()
+        # 安全网恢复后重新搜索
+        return self._switch_to_next_available_key()
 
     def is_quota_error(self, status_code: int, error_message: str | None = None) -> bool:
         """判断是否为配额用尽错误（排除临时限流）
@@ -721,19 +788,34 @@ class APIKeyRotator:
     async def handle_error(self, status_code: int, error_message: str | None = None, session_id: str | None = None):
         """处理API错误，自动判断是否需要切换key（并发安全）
 
+        配额错误采用"多次确认"策略，避免上游临时故障导致 key 被误判为永久耗尽：
+        - 第1次配额错误 → 5分钟冷却
+        - 第2次配额错误 → 10分钟冷却
+        - 第3次配额错误 → 确认真正耗尽，永久标记
+
         Args:
             status_code: HTTP状态码
             error_message: 错误消息
             session_id: 触发错误的会话ID（用于自动分配新key到该会话）
         """
         async with self._lock:
-            if self.is_quota_error(status_code, error_message):
-                logger.warning(
-                    f"检测到配额用尽错误 - Status: {status_code}, Error: {error_message}"
-                )
-                self.mark_key_quota_exhausted(error_message, session_id=session_id)
+            if status_code == 429:
+                # 429 限流：默认视为临时限流，除非消息明确包含配额关键词
+                if error_message and self.is_quota_error(status_code, error_message):
+                    self._handle_quota_error_with_escalation(status_code, error_message, session_id)
+                else:
+                    logger.warning(
+                        f"429临时限流（冷却5分钟） - Status: {status_code}, Error: {error_message}"
+                    )
+                    if self.current_key_index is not None:
+                        current_key = self.api_keys[self.current_key_index]
+                        current_key.mark_rate_limited(cooldown_seconds=300)
+                        self._switch_to_next_available_key()
+            elif self.is_quota_error(status_code, error_message):
+                # 配额类错误：使用逐级升级策略
+                self._handle_quota_error_with_escalation(status_code, error_message, session_id)
             elif status_code == 401:
-                # API key无效
+                # API key无效 → 立即永久标记（无需多次确认）
                 logger.error(f"检测到无效的API Key - Status: {status_code}")
                 self.mark_key_quota_exhausted(f"Invalid API key: {error_message}", session_id=session_id)
             elif self.is_transient_rate_limit(error_message):
@@ -741,40 +823,74 @@ class APIKeyRotator:
                 logger.warning(
                     f"临时限流（冷却5分钟） - Status: {status_code}, Error: {error_message}"
                 )
-                current_key = self.api_keys[self.current_key_index]
-                current_key.mark_rate_limited(cooldown_seconds=300)
-                self._switch_to_next_available_key()
-            elif status_code == 500:
-                # 500服务端错误：检查错误消息判断是配额耗尽还是临时限流
-                if self.is_transient_rate_limit(error_message):
-                    # 临时限流：冷却5分钟后自动恢复
-                    logger.warning(
-                        f"500临时限流（切换key，冷却5分钟） - Status: {status_code}, Error: {error_message}"
-                    )
+                if self.current_key_index is not None:
                     current_key = self.api_keys[self.current_key_index]
                     current_key.mark_rate_limited(cooldown_seconds=300)
                     self._switch_to_next_available_key()
-                elif error_message and any(p in error_message.lower() for p in self.QUOTA_ERROR_PATTERNS):
-                    # 500但消息包含配额关键词（如"额度已用完"）：标记为配额耗尽
+            elif status_code == 500:
+                # 500服务端错误：HTTP 500 表示上游自身有问题，一律临时冷却不永久标记
+                cooldown = 300  # 默认5分钟冷却
+                if error_message and any(p in error_message.lower() for p in self.QUOTA_ERROR_PATTERNS):
+                    cooldown = 600  # 配额类消息冷却10分钟（更保守）
                     logger.warning(
-                        f"500配额耗尽错误 - Status: {status_code}, Error: {error_message}"
+                        f"500疑似配额错误（临时冷却{cooldown}s） - Status: {status_code}, Error: {error_message}"
                     )
-                    self.mark_key_quota_exhausted(error_message, session_id=session_id)
+                elif self.is_transient_rate_limit(error_message):
+                    logger.warning(
+                        f"500临时限流（切换key，冷却5分钟） - Status: {status_code}, Error: {error_message}"
+                    )
                 else:
-                    # 其他500错误：仅标记失败，切换key重试
                     logger.warning(
                         f"500服务端错误（切换key重试） - Status: {status_code}, Error: {error_message}"
                     )
-                    self.mark_key_failure(error_message, switch_key=True)
+                if self.current_key_index is not None:
+                    current_key = self.api_keys[self.current_key_index]
+                    current_key.mark_rate_limited(cooldown_seconds=cooldown)
+                    self._switch_to_next_available_key()
             elif status_code in (502, 503, 504):
-                # 上游网关错误：所有key共用同一个base_url，换key无意义，仅记录
+                # 上游网关错误：所有key共用同一个base_url，换key无意义
+                # 不调用 mark_key_failure，因为网关错误不是特定key的错
                 logger.warning(
                     f"上游网关错误（不换key，直接重试） - Status: {status_code}, Error: {error_message}"
                 )
-                self.mark_key_failure(error_message)
             else:
                 # 其他错误，仅记录不切换
                 self.mark_key_failure(error_message)
+
+    def _handle_quota_error_with_escalation(
+        self, status_code: int, error_message: str | None, session_id: str | None = None
+    ):
+        """配额错误逐级升级处理：临时冷却 → 更长冷却 → 永久标记
+
+        连续配额错误计数：
+        - 1次：5分钟冷却（可能是上游临时故障）
+        - 2次：10分钟冷却（需要更谨慎）
+        - 3次及以上：永久标记为配额耗尽（确认是真的）
+
+        注意：一旦该key成功响应一次，consecutive_quota_errors 会被重置为0
+        """
+        if self.current_key_index is None:
+            logger.error("无法处理配额错误：current_key_index 为 None")
+            return
+
+        current_key = self.api_keys[self.current_key_index]
+        current_key.consecutive_quota_errors += 1
+        strikes = current_key.consecutive_quota_errors
+
+        if strikes >= 3:
+            logger.warning(
+                f"Key [{current_key.name}] 连续 {strikes} 次配额错误，确认配额耗尽，"
+                f"永久标记 - Status: {status_code}, Error: {error_message}"
+            )
+            self.mark_key_quota_exhausted(error_message, session_id=session_id)
+        else:
+            cooldown = 300 * strikes  # 第1次5分钟，第2次10分钟
+            logger.warning(
+                f"Key [{current_key.name}] 第 {strikes}/3 次配额错误"
+                f"（需连续3次才永久标记），临时冷却 {cooldown}s - Status: {status_code}"
+            )
+            current_key.mark_rate_limited(cooldown_seconds=cooldown)
+            self._switch_to_next_available_key()
 
     def get_status(self) -> dict[str, Any]:
         """获取所有key的状态信息和使用统计"""
@@ -800,6 +916,8 @@ class APIKeyRotator:
                 "cost_ratio": f"{key.cost_usage_ratio():.1%}" if key.daily_limit else None,
                 "weight": key.weight,
                 "last_error": key.last_error,
+                "consecutive_quota_errors": key.consecutive_quota_errors,
+                "rate_limited_until": key.rate_limited_until if key.rate_limited_until else None,
             }
 
             # 预估剩余时间和耗尽时间

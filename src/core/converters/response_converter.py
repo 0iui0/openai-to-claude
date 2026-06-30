@@ -5,12 +5,14 @@ OpenAI-to-Anthropic 响应转换器
 """
 
 import json
+import re
 import time
 import traceback
 from collections.abc import AsyncIterator
 from typing import Any
 
 from src.common.token_cache import get_cached_tokens
+from src.core.clients.openai_client import OpenAIClientError
 
 from .stream_converters import (
     StreamState,
@@ -39,6 +41,19 @@ from src.models.openai import (
     OpenAIChoice,
     OpenAIMessage,
 )
+
+
+# Gemma 等本地模型可能在文本开头输出 <channel|> 或 <channel|channel> 等前缀。
+# 这些是模型自身的格式标记，对用户无意义，在此统一滤除。
+_MODEL_ARTIFACT_PREFIX = re.compile(r'^<channel[^>]*>\s*')
+
+
+def _clean_model_output(text: str) -> str:
+    """清理模型输出中的已知伪影"""
+    if not text:
+        return text
+    text = _MODEL_ARTIFACT_PREFIX.sub('', text)
+    return text.strip()
 
 
 class OpenAIToAnthropicConverter:
@@ -189,14 +204,14 @@ class OpenAIToAnthropicConverter:
                 if clean_content:
                     content_blocks.append(
                         AnthropicContentBlock(
-                            type=AnthropicContentTypes.TEXT, text=clean_content
+                            type=AnthropicContentTypes.TEXT, text=_clean_model_output(clean_content)
                         )
                     )
             else:
                 # 没有思考标签，直接作为普通内容
                 content_blocks.append(
                     AnthropicContentBlock(
-                        type=AnthropicContentTypes.TEXT, text=content_str.strip()
+                        type=AnthropicContentTypes.TEXT, text=_clean_model_output(content_str)
                     )
                 )
         elif reasoning_content and isinstance(reasoning_content, str) and reasoning_content.strip():
@@ -423,6 +438,12 @@ class OpenAIToAnthropicConverter:
                         )
                         traceback.print_exc()
 
+        except OpenAIClientError:
+            # 传播给调用者处理（用于流式重试逻辑）
+            raise
+        except GeneratorExit:
+            # 客户端断开连接或上层generator被aclose()，正常退出
+            return
         except Exception as error:
             bound_logger.error(
                 f"Stream conversion error - Error: {str(error)}", exc_info=True
@@ -432,3 +453,9 @@ class OpenAIToAnthropicConverter:
                 "message": {"type": "api_error", "message": str(error)},
             }
             yield format_event("error", error_event)
+        finally:
+            # 显式关闭上游异步生成器，避免依赖 asyncio 的 asyncgen finalizer
+            # 触发 "aclose(): asynchronous generator is already running" 竞态。
+            # aclose() 对已耗尽/已关闭的生成器是幂等的 no-op。
+            if hasattr(openai_stream, "aclose"):
+                await openai_stream.aclose()

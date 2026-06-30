@@ -6,7 +6,9 @@ Anthropic /v1/messages 端点处理程序
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -23,8 +25,46 @@ from src.models.anthropic import (
     AnthropicRequest,
 )
 from src.models.errors import get_error_response
+from loguru import logger
 
 router = APIRouter(prefix="/v1", tags=["messages"])
+
+
+# ---- 模型回退辅助：上下文窗口匹配 ----
+
+def _match_context_window(model_name: str, context_windows: dict[str, int]) -> int | None:
+    """通过最长前缀匹配获取模型的上下文窗口大小。"""
+    best: int | None = None
+    best_len = 0
+    for prefix, window in context_windows.items():
+        if model_name.startswith(prefix) and len(prefix) > best_len:
+            best = window
+            best_len = len(prefix)
+    return best
+
+
+# ---- 超时断路器（跨请求共享） ----
+
+_model_timeout_log: dict[str, list[float]] = {}
+_model_timeout_lock = asyncio.Lock()
+
+
+async def _record_model_timeout(model: str, window: float = 120.0) -> None:
+    """记录一次模型超时，用于断路器状态跟踪。"""
+    async with _model_timeout_lock:
+        now = time.time()
+        entries = _model_timeout_log.setdefault(model, [])
+        entries.append(now)
+        # 清理过期记录
+        _model_timeout_log[model] = [t for t in entries if now - t < window]
+
+
+async def _is_model_circuit_open(model: str, window: float = 120.0, max_timeouts: int = 2) -> bool:
+    """检查模型是否处于断路器打开状态（近期连续超时 >= max_timeouts 次）。"""
+    async with _model_timeout_lock:
+        now = time.time()
+        recent = [t for t in _model_timeout_log.get(model, []) if now - t < window]
+        return len(recent) >= max_timeouts
 
 
 class MessagesHandler:
@@ -101,11 +141,18 @@ class MessagesHandler:
 
         return instance
 
-    async def _get_client_for_session(self, session_id: str | None = None) -> tuple[OpenAIServiceClient, APIKeyInfo | None]:
-        """根据 session 获取对应的 client 和 key 信息（并发安全）
+    async def _get_client_for_session(self, session_id: str | None = None, model_name: str | None = None) -> tuple[OpenAIServiceClient, APIKeyInfo | None]:
+        """根据 session 或模型名获取对应的 client 和 key 信息（并发安全）
+
+        当传入 model_name 且存在多个 key 时，优先选择 model 字段匹配的 key。
+        匹配规则：
+          1. 先通过 config.models.model_aliases 解析别名（如 claude-sonnet-4-6 → gemma4-agentic）
+          2. 再匹配 key.model（精确字符串包含匹配）
+        若无匹配则回退到 session 策略。
 
         Args:
             session_id: 会话标识符（用于 session_affinity 策略）
+            model_name: 请求的模型名（用于模型路由）
 
         Returns:
             (client, key_info) 元组。key_info 在无轮换器时为 None
@@ -113,6 +160,36 @@ class MessagesHandler:
         if self.key_rotator is None:
             return self._clients[0], None
 
+        # 模型名路由：当有多个 key 且指定了模型名时，按 model 字段匹配
+        if model_name and len(self.key_rotator.api_keys) > 1:
+            # 解析模型别名（claude-sonnet-4-6 → gemma4-agentic）
+            resolved_model = model_name
+            if self.config and self.config.models and self.config.models.model_aliases:
+                if model_name in self.config.models.model_aliases:
+                    resolved_model = self.config.models.model_aliases[model_name]
+
+            for key in self.key_rotator.api_keys:
+                if key.model and key.model in resolved_model:
+                    client = self._clients[key.index]
+                    async with self.key_rotator._lock:
+                        self.key_rotator.current_key_index = key.index
+                        if session_id:
+                            self.key_rotator.session_key_mapping[session_id] = key.index
+                    logger.info(f"模型路由: {model_name}(->{resolved_model}) -> Key [{key.name}] (model={key.model})")
+                    return client, key
+
+            # 精确匹配未命中，尝试反向匹配（resolved_model 包含在 key.model 中）
+            for key in self.key_rotator.api_keys:
+                if key.model and resolved_model in key.model:
+                    client = self._clients[key.index]
+                    async with self.key_rotator._lock:
+                        self.key_rotator.current_key_index = key.index
+                        if session_id:
+                            self.key_rotator.session_key_mapping[session_id] = key.index
+                    logger.info(f"模型路由(反向): {model_name}(->{resolved_model}) -> Key [{key.name}] (model={key.model})")
+                    return client, key
+
+        # 回退到 session 策略
         key_info = await self.key_rotator.get_current_key(session_id=session_id)
         client = self._clients[key_info.index]
         return client, key_info
@@ -161,6 +238,7 @@ class MessagesHandler:
         request_id: str | None = None,
         session_id: str | None = None,
         max_retries: int = 3,
+        estimated_input_tokens: int | None = None,
     ):
         """发送请求并在配额用尽时自动重试，支持403权限错误的模型回退
 
@@ -169,6 +247,7 @@ class MessagesHandler:
             request_id: 请求 ID
             session_id: 会话 ID（用于 session_affinity 策略）
             max_retries: 最大重试次数
+            estimated_input_tokens: 预估输入 token 数，用于跳过窗口过小的模型
 
         Returns:
             OpenAI 响应
@@ -182,12 +261,13 @@ class MessagesHandler:
         bound_logger = get_logger_with_request_id(request_id)
         last_error = None
 
-        # 获取当前 session 对应的 client 和 key
-        client, current_key = await self._get_client_for_session(session_id)
+        # 获取当前 session 对应的 client 和 key（按模型名路由）
+        client, current_key = await self._get_client_for_session(session_id, openai_request.model)
 
         while True:
             config = await get_config()
             fallback_models = config.models.fallback_models
+            context_windows = config.models.context_windows
 
             # 检查当前 key 是否有模型覆盖（如本地 vLLM 固定模型）
             if current_key and current_key.model:
@@ -197,12 +277,58 @@ class MessagesHandler:
                 current_model = openai_request.model
                 models_to_try = [current_model] + [m for m in fallback_models if m != current_model]
 
+            # 按上下文窗口和断路器过滤模型
+            if estimated_input_tokens and context_windows:
+                filtered = []
+                for model in models_to_try:
+                    window = _match_context_window(model, context_windows)
+                    if window and estimated_input_tokens > window:
+                        bound_logger.warning(
+                            f"跳过模型 {model}：输入 {estimated_input_tokens} tokens "
+                            f"超过窗口上限 {window} tokens"
+                        )
+                        continue
+                    if await _is_model_circuit_open(model):
+                        bound_logger.warning(
+                            f"跳过模型 {model}：断路器已打开（近期多次超时），跳过"
+                        )
+                        continue
+                    filtered.append(model)
+                if not filtered:
+                    bound_logger.error(
+                        f"所有模型均被跳过（窗口不足或断路器打开），原始列表: {models_to_try}"
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "error": {
+                                "message": (
+                                    f"所有模型均不可用（输入 {estimated_input_tokens} tokens "
+                                    f"超过上下文窗口或断路器打开）"
+                                )
+                            }
+                        },
+                    )
+                if len(filtered) < len(models_to_try):
+                    bound_logger.warning(
+                        f"模型列表已过滤: {models_to_try} -> {filtered}"
+                    )
+                models_to_try = filtered
+
             key_switched_with_override = False
 
             for model_idx, model_to_try in enumerate(models_to_try):
                 openai_request.model = model_to_try
 
+                # 追踪当前模型已尝试过403的key索引（用于换key而非直接跳模型）
+                tried_key_indices: set[int] = set()
+
                 for attempt in range(max_retries):
+                    # 对 fallback 模型使用更短的超时（30s），快速失败
+                    request_timeout: float | None = None
+                    if model_idx > 0:
+                        request_timeout = min(client.timeout, 30.0)
+
                     try:
                         if model_idx > 0:
                             bound_logger.info(
@@ -211,7 +337,7 @@ class MessagesHandler:
 
                         # 使用 session 对应的独立 client 发送请求
                         response = await client.send_request(
-                            openai_request, request_id=request_id
+                            openai_request, request_id=request_id, timeout=request_timeout
                         )
 
                         if model_idx > 0:
@@ -229,8 +355,37 @@ class MessagesHandler:
                         )
 
                         if is_permission_error:
+                            key_name = current_key.name if current_key else "unknown"
+                            if current_key is not None:
+                                tried_key_indices.add(current_key.index)
+
+                            # 先尝试换一个key，所有key都无权使用时才换模型
+                            if self.key_rotator and current_key is not None:
+                                total_keys = len(self.key_rotator.api_keys)
+                                found_new_key = False
+                                for offset in range(1, total_keys):
+                                    next_idx = (current_key.index + offset) % total_keys
+                                    next_key_info = self.key_rotator.api_keys[next_idx]
+                                    if next_key_info.is_available() and next_idx not in tried_key_indices:
+                                        async with self.key_rotator._lock:
+                                            self.key_rotator.current_key_index = next_idx
+                                            if session_id:
+                                                self.key_rotator.session_key_mapping[session_id] = next_idx
+                                        client = self._clients[next_idx]
+                                        current_key = next_key_info
+                                        found_new_key = True
+                                        bound_logger.warning(
+                                            f"检测到403权限错误，模型 {model_to_try} 无权限 (Key: [{key_name}])，"
+                                            f"切换到 Key: [{current_key.name}] 重试同一模型"
+                                        )
+                                        break
+
+                                if found_new_key:
+                                    continue  # 用新key重试同一模型
+
+                            # 所有key都无权使用此模型，尝试下一个模型
                             bound_logger.warning(
-                                f"检测到403权限错误，模型 {model_to_try} 无权限，尝试下一个模型"
+                                f"检测到403权限错误，模型 {model_to_try} 所有Key均无权限，尝试下一个模型"
                             )
                             break
 
@@ -238,12 +393,31 @@ class MessagesHandler:
                             bound_logger.warning(f"客户端错误 {e.status_code}，不重试")
                             break
 
+                        # 504超时：记录断路器，最多重试1次，退避与超时值成比例
+                        is_timeout = (e.status_code == 504)
+                        if is_timeout:
+                            await _record_model_timeout(model_to_try)
+                            if attempt < 1:
+                                effective_timeout = request_timeout or client.timeout
+                                backoff = min(30.0, effective_timeout / 2)
+                                bound_logger.warning(
+                                    f"请求超时，{backoff:.0f}s 后退避重试 (模型: {model_to_try}, "
+                                    f"尝试 {attempt + 1}/{max_retries})"
+                                )
+                                await asyncio.sleep(backoff)
+                                continue
+                            else:
+                                bound_logger.warning(
+                                    f"请求超时重试已用尽 (模型: {model_to_try})，尝试下一个模型"
+                                )
+                                break
+
                         if self.key_rotator and attempt < max_retries - 1:
                             await self._handle_client_error_with_retry(
                                 e, request_id=request_id or "default", session_id=session_id
                             )
                             # 错误处理后重新获取 session 对应的 client 和 key
-                            client, current_key = await self._get_client_for_session(session_id)
+                            client, current_key = await self._get_client_for_session(session_id, openai_request.model)
                             if current_key and current_key.model:
                                 openai_request.model = current_key.model
                                 bound_logger.info(
@@ -279,8 +453,8 @@ class MessagesHandler:
 
         bound_logger = get_logger_with_request_id(request_id)
 
-        # 获取当前 session 对应的 client 和 key
-        client, current_key = await self._get_client_for_session(session_id)
+        # 获取当前 session 对应的 client 和 key（按模型名路由）
+        client, current_key = await self._get_client_for_session(session_id, request.model)
 
         try:
             bound_logger.debug("处理非流式请求")
@@ -291,9 +465,14 @@ class MessagesHandler:
                 request, request_id
             )
 
+            # 获取缓存的输入 token 数，用于跳过窗口过小的 fallback 模型
+            from src.common.token_cache import get_cached_tokens
+            estimated_input_tokens = get_cached_tokens(request_id, delete=False)
+
             # 发送到 OpenAI（带重试机制），传递 session_id
             openai_response = await self._send_request_with_retry(
-                openai_request, request_id=request_id, session_id=session_id
+                openai_request, request_id=request_id, session_id=session_id,
+                estimated_input_tokens=estimated_input_tokens,
             )
             bound_logger.debug(
                 f"OpenAI 响应: {json.dumps(openai_response, ensure_ascii=False)}"
@@ -370,113 +549,347 @@ class MessagesHandler:
     async def process_stream_message(
         self, request: AnthropicRequest, request_id: str = None, session_id: str | None = None
     ) -> AsyncGenerator[str, None]:
-        """处理流式消息请求，使用新的流式转换器"""
+        """处理流式消息请求，支持模型回退和key轮换重试"""
         if not request.stream:
             raise ValueError("流式响应参数必须为true")
 
-        # 获取绑定了请求ID的logger
         from src.common.logging import get_logger_with_request_id
+        from src.config.settings import get_config
 
         bound_logger = get_logger_with_request_id(request_id)
-        total_tokens_used = 0  # 用于收集流式响应的 token 使用量
+        total_tokens_used = 0
 
-        # 获取当前 session 对应的 client 和 key
-        stream_client, current_key = await self._get_client_for_session(session_id)
+        # 获取当前 session 对应的 client 和 key（按模型名路由）
+        stream_client, current_key = await self._get_client_for_session(session_id, request.model)
 
         try:
-            # await validate_anthropic_request(request, request_id)
+            # 转换请求（只做一次，重试时复用）
             openai_request = await self.request_converter.convert_anthropic_to_openai(
                 request, request_id
             )
 
-            # 检查当前 key 是否有模型覆盖（如本地 vLLM 固定模型）
+            # 获取缓存的输入 token 数，用于跳过窗口过小的 fallback 模型
+            from src.common.token_cache import get_cached_tokens
+            estimated_input_tokens = get_cached_tokens(request_id, delete=False)
+
+            # 确定要尝试的模型列表（与 _send_request_with_retry 一致）
+            config = await get_config()
             if current_key and current_key.model:
+                models_to_try = [current_key.model]
                 openai_request.model = current_key.model
                 bound_logger.info(
                     f"流式请求应用 key [{current_key.name}] 的固定模型: {current_key.model}"
                 )
+            else:
+                current_model = openai_request.model
+                fallback_models = config.models.fallback_models if config.models else []
+                models_to_try = [current_model] + [
+                    m for m in fallback_models if m != current_model
+                ]
 
-            # 创建 OpenAI 流式数据源（使用 session 对应的独立 client）
-            async def openai_stream_generator():
-                bound_logger.info("开始OpenAI流式生成")
-                chunk_count = 0
-                async for chunk in stream_client.send_streaming_request(
-                    openai_request, request_id=request_id
-                ):
-                    # 跳过被解析器过滤掉的不完整chunk（通常是tool_calls片段）
-                    if chunk is not None:
-                        chunk_count += 1
-                        # 将 OpenAI 响应对象转换为字符串格式
-                        bound_logger.debug(f"OpenAI event: {chunk}")
-                        yield f"{chunk}\n\n"
-                bound_logger.debug(f"OpenAI流式生成完成，总共{chunk_count}个chunk")
-
-            # 使用新的流式转换器
-            bound_logger.info("开始流式转换")
-            async for (
-                anthropic_event
-            ) in self.response_converter.convert_openai_stream_to_anthropic_stream(
-                openai_stream_generator(), model=request.model, request_id=request_id
-            ):
-                bound_logger.debug(f"Anthropic event: {anthropic_event}")
-
-                # 尝试从事件中提取 usage 信息
-                try:
-                    event_data = json.loads(anthropic_event.split("data: ")[1])
-                    if "usage" in event_data and event_data["usage"]:
-                        usage = event_data["usage"]
-                        total_tokens_used = (
-                            (usage.get("input_tokens") or 0)
-                            + (usage.get("output_tokens") or 0)
+            # 按上下文窗口和断路器过滤模型
+            context_windows = config.models.context_windows if config.models else {}
+            if estimated_input_tokens and context_windows:
+                filtered = []
+                for model in models_to_try:
+                    window = _match_context_window(model, context_windows)
+                    if window and estimated_input_tokens > window:
+                        bound_logger.warning(
+                            f"跳过模型 {model}：输入 {estimated_input_tokens} tokens "
+                            f"超过窗口上限 {window} tokens"
                         )
-                        bound_logger.debug(
-                            f"流式响应 token 使用量: {total_tokens_used}"
+                        continue
+                    if await _is_model_circuit_open(model):
+                        bound_logger.warning(
+                            f"跳过模型 {model}：断路器已打开（近期多次超时），跳过"
                         )
-                except (IndexError, json.JSONDecodeError, KeyError):
-                    pass
+                        continue
+                    filtered.append(model)
+                if not filtered:
+                    bound_logger.error(
+                        f"所有模型均被跳过（窗口不足或断路器打开），原始列表: {models_to_try}"
+                    )
+                    error_resp = get_error_response(
+                        503,
+                        message=(
+                            f"所有模型均不可用（输入 {estimated_input_tokens} tokens "
+                            f"超过上下文窗口或断路器打开）"
+                        ),
+                    )
+                    error_data = error_resp.model_dump()
+                    if request_id:
+                        error_data["request_id"] = request_id
+                    yield (
+                        f"event: error\ndata: "
+                        f"{json.dumps(error_data, ensure_ascii=False)}\n\n"
+                    )
+                    return
+                if len(filtered) < len(models_to_try):
+                    bound_logger.warning(
+                        f"模型列表已过滤: {models_to_try} -> {filtered}"
+                    )
+                models_to_try = filtered
 
-                yield anthropic_event
-            bound_logger.info("流式转换完成")
+            last_error = None
 
-            # 标记 API key 使用成功，并统计 token 使用量（使用 session 对应的 key）
-            if current_key and total_tokens_used > 0:
-                current_key.mark_success(tokens_used=total_tokens_used)
+            for model_idx, model_to_try in enumerate(models_to_try):
+                openai_request.model = model_to_try
 
-        except (ValidationError, ValueError) as e:
-            error_detail = e.errors() if hasattr(e, "errors") else str(e)
-            bound_logger.warning(f"流式请求验证失败 - Errors: {error_detail}")
-            error_response = get_error_response(422, message=str(error_detail))
-            # 在错误响应中添加请求ID
-            error_data = error_response.model_dump()
+                # 追踪当前模型已尝试过403的key索引
+                tried_key_indices: set[int] = set()
+
+                for attempt in range(2):  # 流式每模型最多2次尝试
+                    try:
+                        if model_idx > 0 and attempt == 0:
+                            bound_logger.info(
+                                f"流式请求回退模型: {model_to_try}"
+                            )
+
+                        # 对 fallback 模型使用更短的超时（30s），快速失败
+                        stream_timeout: float | None = None
+                        if model_idx > 0:
+                            stream_timeout = min(stream_client.timeout, 30.0)
+
+                        # 为每次尝试创建独立的流数据源
+                        async def _make_openai_stream():
+                            # 用 aclosing 显式关闭上游生成器，避免依赖 asyncio 的
+                            # asyncgen finalizer 触发 "aclose(): asynchronous generator
+                            # is already running" 竞态
+                            async with aclosing(
+                                stream_client.send_streaming_request(
+                                    openai_request, request_id=request_id, timeout=stream_timeout
+                                )
+                            ) as openai_stream:
+                                try:
+                                    async for chunk in openai_stream:
+                                        if chunk is not None:
+                                            yield f"{chunk}\n\n"
+                                except GeneratorExit:
+                                    return
+                                except RuntimeError as e:
+                                    msg = str(e)
+                                    if "aclose" in msg or "already running" in msg:
+                                        return
+                                    raise
+
+                        # 流式转换并yield事件（aclosing 确保转换器及上游链被有序关闭）
+                        async with aclosing(
+                            self.response_converter.convert_openai_stream_to_anthropic_stream(
+                                _make_openai_stream(),
+                                model=request.model,
+                                request_id=request_id,
+                            )
+                        ) as anthropic_stream:
+                            async for anthropic_event in anthropic_stream:
+                                # 提取 usage 信息
+                                try:
+                                    event_data = json.loads(
+                                        anthropic_event.split("data: ")[1]
+                                    )
+                                    if "usage" in event_data and event_data["usage"]:
+                                        usage = event_data["usage"]
+                                        total_tokens_used = (
+                                            (usage.get("input_tokens") or 0)
+                                            + (usage.get("output_tokens") or 0)
+                                        )
+                                except (IndexError, json.JSONDecodeError, KeyError):
+                                    pass
+
+                                yield anthropic_event
+
+                        # 流式成功完成
+                        bound_logger.info("流式转换完成")
+                        if current_key and total_tokens_used > 0:
+                            current_key.mark_success(tokens_used=total_tokens_used)
+                        return
+
+                    except GeneratorExit:
+                        raise  # 客户端断开，向上传播
+                    except RuntimeError as e:
+                        msg = str(e)
+                        if "aclose" in msg or "already running" in msg:
+                            return  # 客户端断开导致的aclose
+                        raise
+
+                    except OpenAIClientError as e:
+                        last_error = e
+                        is_permission_error = e.status_code == 403
+                        is_client_error = (
+                            (400 <= (e.status_code or 0) < 500)
+                            and e.status_code not in (403, 429)
+                        )
+
+                        bound_logger.warning(
+                            f"流式请求失败 (模型: {model_to_try}, "
+                            f"尝试 {attempt + 1}/2) - Status: {e.status_code}"
+                        )
+
+                        if is_permission_error:
+                            key_name = current_key.name if current_key else "unknown"
+                            if current_key is not None:
+                                tried_key_indices.add(current_key.index)
+
+                            # 先尝试换一个key，所有key都无权使用时才换模型
+                            if self.key_rotator and current_key is not None:
+                                total_keys = len(self.key_rotator.api_keys)
+                                found_new_key = False
+                                for offset in range(1, total_keys):
+                                    next_idx = (current_key.index + offset) % total_keys
+                                    next_key_info = self.key_rotator.api_keys[next_idx]
+                                    if next_key_info.is_available() and next_idx not in tried_key_indices:
+                                        async with self.key_rotator._lock:
+                                            self.key_rotator.current_key_index = next_idx
+                                            if session_id:
+                                                self.key_rotator.session_key_mapping[session_id] = next_idx
+                                        stream_client = self._clients[next_idx]
+                                        current_key = next_key_info
+                                        found_new_key = True
+                                        bound_logger.warning(
+                                            f"检测到403权限错误，模型 {model_to_try} 无权限 (Key: [{key_name}])，"
+                                            f"切换到 Key: [{current_key.name}] 重试同一模型"
+                                        )
+                                        break
+
+                                if found_new_key:
+                                    continue  # 用新key重试同一模型
+
+                            # 所有key都无权使用此模型，尝试下一个模型
+                            bound_logger.warning(
+                                f"检测到403权限错误，模型 {model_to_try} 所有Key均无权限，尝试下一个模型"
+                            )
+                            break  # 尝试下一个模型
+
+                        if is_client_error:
+                            bound_logger.warning(
+                                f"客户端错误 {e.status_code}，不重试"
+                            )
+                            error_resp = get_error_response(
+                                e.status_code or 400,
+                                message=str(e.error_response.error),
+                            )
+                            error_data = error_resp.model_dump()
+                            if request_id:
+                                error_data["request_id"] = request_id
+                            yield (
+                                f"event: error\ndata: "
+                                f"{json.dumps(error_data, ensure_ascii=False)}\n\n"
+                            )
+                            return
+
+                        # 504超时：记录断路器，最多重试1次，退避与超时值成比例
+                        if e.status_code == 504:
+                            await _record_model_timeout(model_to_try)
+                            if attempt < 1:
+                                effective_timeout = stream_timeout or stream_client.timeout
+                                backoff = min(30.0, effective_timeout / 2)
+                                bound_logger.warning(
+                                    f"流式请求超时，{backoff:.0f}s 后退避重试 (模型: {model_to_try}, "
+                                    f"尝试 {attempt + 1}/2)"
+                                )
+                                await asyncio.sleep(backoff)
+                                continue
+                            else:
+                                bound_logger.warning(
+                                    f"流式请求超时重试已用尽 (模型: {model_to_try})，"
+                                    f"尝试下一个模型"
+                                )
+                                break
+
+                        # 其他服务端错误：换key重试
+                        if self.key_rotator and attempt < 1:
+                            await self._handle_client_error_with_retry(
+                                e,
+                                request_id=request_id or "default",
+                                session_id=session_id,
+                            )
+                            stream_client, current_key = await self._get_client_for_session(
+                                session_id, request.model
+                            )
+                            if current_key and current_key.model:
+                                openai_request.model = current_key.model
+                                bound_logger.info(
+                                    f"新 key [{current_key.name}] 有固定模型，"
+                                    f"切换至: {current_key.model}"
+                                )
+                                break
+                            continue
+                        break
+
+                    except (ValidationError, ValueError) as e:
+                        error_detail = (
+                            e.errors() if hasattr(e, "errors") else str(e)
+                        )
+                        bound_logger.warning(
+                            f"流式请求验证失败 - Errors: {error_detail}"
+                        )
+                        error_resp = get_error_response(
+                            422, message=str(error_detail)
+                        )
+                        error_data = error_resp.model_dump()
+                        if request_id:
+                            error_data["request_id"] = request_id
+                        yield (
+                            f"event: error\ndata: "
+                            f"{json.dumps(error_data, ensure_ascii=False)}\n\n"
+                        )
+                        return
+
+                    except json.JSONDecodeError as e:
+                        bound_logger.exception(
+                            f"流式模式JSON解析错误 - Error: {str(e)}"
+                        )
+                        error_resp = get_error_response(
+                            502,
+                            message="流式响应中发现无效JSON格式",
+                            details={
+                                "json_error": str(e),
+                                "request_id": request_id,
+                            },
+                        )
+                        error_data = error_resp.model_dump()
+                        if request_id:
+                            error_data["request_id"] = request_id
+                        yield (
+                            f"event: error\ndata: "
+                            f"{json.dumps(error_data, ensure_ascii=False)}\n\n"
+                        )
+                        return
+
+            # 所有重试已用尽
+            error_msg = (
+                f"流式请求所有模型尝试均失败: {', '.join(models_to_try)}"
+            )
+            bound_logger.error(error_msg)
+            error_resp = get_error_response(
+                last_error.status_code if last_error else 502,
+                message=error_msg,
+            )
+            error_data = error_resp.model_dump()
             if request_id:
                 error_data["request_id"] = request_id
-            yield f"event: error\ndata: {json.dumps(error_data, ensure_ascii=False)}\n\n"
-
-        except json.JSONDecodeError as e:
-            # 专门处理流式模式下的JSON解析错误
-            bound_logger.exception(
-                f"流式模式JSON解析错误 - Error: {str(e)}, Position: {e.pos if hasattr(e, 'pos') else 'unknown'}"
+            yield (
+                f"event: error\ndata: "
+                f"{json.dumps(error_data, ensure_ascii=False)}\n\n"
             )
-            error_response = get_error_response(
-                502,
-                message="流式响应中发现无效JSON格式",
-                details={"json_error": str(e), "request_id": request_id},
-            )
-            error_data = error_response.model_dump()
-            if request_id:
-                error_data["request_id"] = request_id
-            yield f"event: error\ndata: {json.dumps(error_data, ensure_ascii=False)}\n\n"
 
+        except GeneratorExit:
+            raise  # 客户端断开
+        except RuntimeError as e:
+            if "aclose" in str(e) or "already running" in str(e):
+                return  # 客户端断开导致的aclose
+            raise
         except Exception as e:
             bound_logger.exception(
                 f"流式请求处理错误 - Type: {type(e).__name__}, Error: {str(e)}"
             )
-            error_response = get_error_response(500, message=str(e))
-            # 在错误响应中添加请求ID
-            error_data = error_response.model_dump()
+            error_resp = get_error_response(500, message=str(e))
+            error_data = error_resp.model_dump()
             if request_id:
                 error_data["request_id"] = request_id
-            yield f"event: error\ndata: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+            yield (
+                f"event: error\ndata: "
+                f"{json.dumps(error_data, ensure_ascii=False)}\n\n"
+            )
 
 
 def _normalize_request_body(body: dict, bound_logger) -> dict:
@@ -612,14 +1025,30 @@ async def messages_endpoint(request: Request, background_tasks: BackgroundTasks)
             async def stream_wrapper():
                 """包装器确保流式响应的立即传输"""
                 try:
-                    async for chunk in handler.process_stream_message(
-                        anthropic_request, request_id=request_id, session_id=session_id
-                    ):
-                        # 立即传输每个chunk，不缓冲
-                        # chunk已经是完整的SSE格式字符串，编码后返回
-                        yield chunk.encode("utf-8")
-                        # 强制刷新缓冲区（在某些环境中有效）
-                        await asyncio.sleep(0)
+                    # aclosing 确保客户端断开或正常结束时，整条生成器链被有序关闭，
+                    # 而非依赖 asyncio 的 asyncgen finalizer（后者会触发
+                    # "aclose(): asynchronous generator is already running" 竞态）
+                    async with aclosing(
+                        handler.process_stream_message(
+                            anthropic_request, request_id=request_id, session_id=session_id
+                        )
+                    ) as stream:
+                        async for chunk in stream:
+                            # 立即传输每个chunk，不缓冲
+                            # chunk已经是完整的SSE格式字符串，编码后返回
+                            yield chunk.encode("utf-8")
+                            # 强制刷新缓冲区（在某些环境中有效）
+                            await asyncio.sleep(0)
+                except GeneratorExit:
+                    # 客户端断开连接，正常清理
+                    return
+                except RuntimeError as e:
+                    msg = str(e)
+                    if "aclose" in msg or "already running" in msg:
+                        # Python 3.11+: 在运行中的async generator上调用aclose()
+                        # 会触发此RuntimeError。客户端断开时可能发生，正常清理。
+                        return
+                    raise
                 except Exception as e:
                     # 如果流式处理出错，记录完整错误并发送错误事件
                     bound_logger.exception(f"流式处理出错 - Error: {str(e)}")
